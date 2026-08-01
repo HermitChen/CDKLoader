@@ -1,0 +1,14 @@
+.git
+.DS_Store
+.codex
+AGENTS.md
+.env
+.venv
+.pytest_cache
+__pycache__
+*.py[cod]
+data
+tests
+frontend/node_modules
+frontend/dist
+app/static

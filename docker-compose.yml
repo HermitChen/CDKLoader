@@ -1,0 +1,28 @@
+name: cdkloader
+
+services:
+  cdkloader:
+    image: "${CDK_LOADER_IMAGE:-ghcr.io/hermitchen/cdkloader:20260801}"
+    ports:
+      - "${CDK_LOADER_PORT:-1456}:1456"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-sqlite:////app/data/cdkloader.db}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-change-me}"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-change-me-admin-token}"
+      CREDENTIAL_SECRET: "${CREDENTIAL_SECRET:-development-credential-secret}"
+      CDK_PEPPER: "${CDK_PEPPER:-development-cdk-pepper}"
+      VALIDATION_MODE: "${VALIDATION_MODE:-remote}"
+      VALIDATION_TIMEOUT_SECONDS: "${VALIDATION_TIMEOUT_SECONDS:-5}"
+      VALIDATION_ATTEMPTS: "${VALIDATION_ATTEMPTS:-2}"
+      VALIDATION_CONCURRENCY: "${VALIDATION_CONCURRENCY:-6}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:1456}"
+    volumes:
+      - ./data:/app/data
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1456/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
