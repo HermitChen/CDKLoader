@@ -83,6 +83,8 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .today-redemptions svg { color: hsl(var(--muted-foreground)); transition: transform .16s ease, color .16s ease; }
 .today-redemptions:hover svg { transform: translateX(2px); color: hsl(var(--foreground)); }
 .today-filter { display: inline-flex; align-items: center; gap: 4px; }
+.relation-filter { display: inline-flex; min-width: 0; max-width: 260px; align-items: center; gap: 4px; padding: 2px 3px 2px 9px; border: 1px solid hsl(var(--border)); border-radius: 5px; color: hsl(var(--muted-foreground)); background: hsl(var(--secondary) / .5); font-size: 11px; }
+.relation-filter > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .workspace-section { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; margin-top: 25px; animation: section-in .22s ease-out both; }
 .list-summary { display: flex; align-items: baseline; gap: 6px; color: hsl(var(--muted-foreground)); font-size: 11px; white-space: nowrap; }
@@ -114,6 +116,17 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .selection-cell .ui-checkbox { justify-content: center; }
 .action-cell { width: 74px; min-width: 74px; text-align: center; }
 .action-cell .ui-btn { margin: 0 auto; }
+.accounts-table table { min-width: 1060px; }
+.cdks-table table { min-width: 1100px; }
+.redemptions-table table { min-width: 980px; }
+.relation-cell { min-width: 124px; }
+.relation-code, .relation-count { display: inline-flex; max-width: 250px; align-items: center; gap: 5px; overflow: hidden; padding: 0; border: 0; border-radius: 0; color: hsl(var(--foreground)); background: transparent; cursor: pointer; font: 600 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; text-overflow: ellipsis; white-space: nowrap; transition: color .16s ease; }
+.relation-code:hover, .relation-count:hover { color: hsl(var(--primary)); text-decoration: underline; text-underline-offset: 3px; }
+.relation-code:focus-visible, .relation-count:focus-visible { outline: 2px solid hsl(var(--primary)); outline-offset: 3px; }
+.relation-count { color: hsl(var(--tone-info-strong)); font-family: inherit; font-weight: 600; }
+.relation-count svg { flex: 0 0 auto; }
+.relation-stack { display: grid; gap: 5px; }
+.delivery-summary { display: grid; gap: 5px; }
 .pagination-bar { display: flex; min-height: 42px; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 2px 0; color: hsl(var(--muted-foreground)); font-size: 11px; font-variant-numeric: tabular-nums; }
 .pagination-controls { display: inline-flex; align-items: center; gap: 7px; }
 .page-size-select { min-width: 92px; }
@@ -167,6 +180,7 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
   .overview-grid { gap: 8px; }
   .filter-group { display: grid; grid-template-columns: 1fr; width: 100%; }
   .search-field, .quota-search-field { width: 100%; }
+  .relation-filter { max-width: 100%; justify-content: space-between; }
   .pagination-bar { align-items: flex-start; flex-direction: column; gap: 8px; }
   .pagination-controls { width: 100%; justify-content: space-between; }
   .selection-actions { flex-wrap: wrap; }

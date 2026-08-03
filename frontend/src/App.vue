@@ -12,6 +12,7 @@ import {
   Github,
   KeyRound,
   LayoutDashboard,
+  ListChecks,
   LoaderCircle,
   LockKeyhole,
   LogOut,
@@ -69,12 +70,13 @@ const redemptionPage = ref(1)
 const accountPageSize = ref(15)
 const cdkPageSize = ref(15)
 const redemptionPageSize = ref(15)
-const accountFilters = ref({ q: '', status: '', has_refresh_token: '' })
+const accountFilters = ref({ q: '', status: '', has_refresh_token: '', cdk_id: '', redemption_id: '', relation_label: '' })
 const cdkFilters = ref({ q: '', quota: '', status: '' })
 const redemptionFilters = ref({ q: '', status: '', today: false })
 const selectedAccountIds = ref([])
 const selectedCdkIds = ref([])
 const selectedRedemptionIds = ref([])
+const selectionBusy = ref('')
 const accountMessage = ref('')
 const redemptionMessage = ref('')
 const toasts = ref([])
@@ -132,9 +134,9 @@ const redemptionStatusOptions = [
 
 const pageMeta = {
   overview: { title: '概览', description: '账号库存、CDK 额度和今日兑换状态。' },
-  accounts: { title: '账号池', description: '筛选账号库存，管理导入与批量清理。' },
-  cdks: { title: 'CDK', description: '管理提取码、额度、有效期和交付格式。' },
-  redemptions: { title: '兑换记录', description: '查看提取任务的请求、交付和失败状态。' },
+  accounts: { title: '账号池', description: '筛选账号库存，核对关联 CDK 并支持二次导出。' },
+  cdks: { title: 'CDK', description: '管理提取码、额度、有效期和已兑换账号。' },
+  redemptions: { title: '兑换记录', description: '查看完整 CDK、交付状态和关联账号。' },
 }
 
 const publicCodes = computed(() => codeInput.value.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean))
@@ -145,6 +147,8 @@ const publicStatusText = computed(() => ({
   processing: '正在验活并补位',
   completed: '交付已完成',
   failed: '任务未完成',
+  redelivery_ready: '已兑换，补发已就绪',
+  redelivery_completed: '已兑换，补发完成',
 }[publicStatus.value] || ''))
 const selectedAccountsOnPage = computed(() => accounts.value.filter((item) => selectedAccountIds.value.includes(item.id)).length)
 const selectedCdksOnPage = computed(() => cdks.value.filter((item) => selectedCdkIds.value.includes(item.id)).length)
@@ -152,9 +156,14 @@ const selectedRedemptionsOnPage = computed(() => redemptions.value.filter((item)
 const allAccountsSelected = computed(() => accounts.value.length > 0 && selectedAccountsOnPage.value === accounts.value.length)
 const allCdksSelected = computed(() => cdks.value.length > 0 && selectedCdksOnPage.value === cdks.value.length)
 const allRedemptionsSelected = computed(() => redemptions.value.length > 0 && selectedRedemptionsOnPage.value === redemptions.value.length)
+const allAccountResultsSelected = computed(() => accountTotal.value > 0 && selectedAccountIds.value.length === accountTotal.value)
+const allCdkResultsSelected = computed(() => cdkTotal.value > 0 && selectedCdkIds.value.length === cdkTotal.value)
+const allRedemptionResultsSelected = computed(() => redemptionTotal.value > 0 && selectedRedemptionIds.value.length === redemptionTotal.value)
+
+const maxBulkSelection = 5000
 
 function statusTone(value) {
-  if (['available', 'completed', 'unused', 'validating'].includes(value)) return 'success'
+  if (['available', 'completed', 'unused', 'validating', 'redelivery_ready', 'redelivery_completed'].includes(value)) return 'success'
   if (['reserved', 'partial', 'processing', 'queued', 'pending_validation'].includes(value)) return 'warning'
   if (['expired', 'banned', 'failed', 'exhausted', 'disabled'].includes(value)) return 'error'
   return 'neutral'
@@ -171,8 +180,15 @@ function statusLabel(value) {
 
 function formatDate(value, format = 'datetime') {
   if (!value) return '—'
-  const options = format === 'date' ? { dateStyle: 'medium' } : { dateStyle: 'medium', timeStyle: 'short' }
+  const options = format === 'date'
+    ? { dateStyle: 'medium', timeZone: 'Asia/Shanghai' }
+    : { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Shanghai' }
   return new Intl.DateTimeFormat('zh-CN', options).format(new Date(value))
+}
+
+function cdkLabel(cdk) {
+  if (!cdk) return '—'
+  return cdk.code || `${cdk.prefix}-****`
 }
 
 function messageTone(message) {
@@ -246,6 +262,8 @@ function filterParams(filters) {
   if (filters.quota?.trim()) params.set('quota', filters.quota.trim())
   if (filters.status) params.set('status', filters.status)
   if (filters.has_refresh_token) params.set('has_refresh_token', filters.has_refresh_token)
+  if (filters.cdk_id) params.set('cdk_id', filters.cdk_id)
+  if (filters.redemption_id) params.set('redemption_id', filters.redemption_id)
   if (filters.today) params.set('today', 'true')
   return params
 }
@@ -282,16 +300,24 @@ function searchAccounts() {
 }
 
 async function exportSelectedAccounts() {
-  const selectedCount = selectedAccountIds.value.length
+  await exportAccounts(selectedAccountIds.value, '导出完成')
+}
+
+async function reexportAccount(account) {
+  await exportAccounts([account.id], '二次导出完成')
+}
+
+async function exportAccounts(ids, title) {
+  const selectedCount = ids.length
   if (!selectedCount) return
   accountExportBusy.value = true
   try {
     await download('/admin/accounts/export', {
       method: 'POST',
       headers: { ...adminHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: selectedAccountIds.value }),
+      body: JSON.stringify({ ids }),
     })
-    pushToast('success', '导出完成', `已导出选中的 ${selectedCount} 个账号。`)
+    pushToast('success', title, `已导出 ${selectedCount} 个账号。`)
   } catch (error) {
     pushToast('error', '导出失败', error.message)
   } finally {
@@ -397,6 +423,51 @@ function clearTodayRedemptionFilter() {
   loadRedemptions({ clearSelection: true })
 }
 
+function openAccountsForCdk(cdk) {
+  activeView.value = 'accounts'
+  accountFilters.value = {
+    q: '',
+    status: '',
+    has_refresh_token: '',
+    cdk_id: cdk.id,
+    redemption_id: '',
+    relation_label: `CDK：${cdkLabel(cdk)}`,
+  }
+  accountPage.value = 1
+  loadAccounts({ clearSelection: true })
+}
+
+function openAccountsForRedemption(redemption) {
+  activeView.value = 'accounts'
+  accountFilters.value = {
+    q: '',
+    status: '',
+    has_refresh_token: '',
+    cdk_id: '',
+    redemption_id: redemption.id,
+    relation_label: `兑换任务：${redemption.id.slice(0, 8)}`,
+  }
+  accountPage.value = 1
+  loadAccounts({ clearSelection: true })
+}
+
+function clearAccountRelationFilter() {
+  accountFilters.value.cdk_id = ''
+  accountFilters.value.redemption_id = ''
+  accountFilters.value.relation_label = ''
+  accountPage.value = 1
+  loadAccounts({ clearSelection: true })
+}
+
+function openCdkForAccount(account) {
+  const cdk = account.related_cdk
+  if (!cdk) return
+  activeView.value = 'cdks'
+  cdkFilters.value = { q: cdk.code || cdk.prefix, quota: '', status: '' }
+  cdkPage.value = 1
+  loadCdks({ clearSelection: true })
+}
+
 function updateSelection(selected, id, checked) {
   if (checked && !selected.value.includes(id)) selected.value = [...selected.value, id]
   if (!checked) selected.value = selected.value.filter((item) => item !== id)
@@ -417,6 +488,58 @@ function toggleCurrentPage(items, selected, checked) {
 function toggleAllAccounts(checked) { toggleCurrentPage(accounts, selectedAccountIds, checked) }
 function toggleAllCdks(checked) { toggleCurrentPage(cdks, selectedCdkIds, checked) }
 function toggleAllRedemptions(checked) { toggleCurrentPage(redemptions, selectedRedemptionIds, checked) }
+
+function selectionConfig(kind) {
+  return {
+    accounts: {
+      endpoint: '/admin/accounts',
+      filters: accountFilters,
+      selected: selectedAccountIds,
+      total: accountTotal,
+      label: '账号',
+      allSelected: allAccountResultsSelected,
+    },
+    cdks: {
+      endpoint: '/admin/cdks',
+      filters: cdkFilters,
+      selected: selectedCdkIds,
+      total: cdkTotal,
+      label: 'CDK',
+      allSelected: allCdkResultsSelected,
+    },
+    redemptions: {
+      endpoint: '/admin/redemptions',
+      filters: redemptionFilters,
+      selected: selectedRedemptionIds,
+      total: redemptionTotal,
+      label: '兑换记录',
+      allSelected: allRedemptionResultsSelected,
+    },
+  }[kind]
+}
+
+async function toggleAllResults(kind) {
+  const config = selectionConfig(kind)
+  if (!config || selectionBusy.value) return
+  if (config.allSelected.value) {
+    config.selected.value = []
+    return
+  }
+  if (config.total.value > maxBulkSelection) {
+    pushToast('warning', '无法跨页全选', `当前筛选结果有 ${config.total.value} 个${config.label}，单次最多选择 ${maxBulkSelection} 项。`)
+    return
+  }
+  selectionBusy.value = kind
+  try {
+    const result = await adminRequest(`${config.endpoint}${listQuery(config.filters.value, 1, 0)}`)
+    if (result.total !== result.items.length) throw new ApiError('未能加载全部筛选结果，请缩小筛选范围后重试。')
+    config.selected.value = result.items.map((item) => item.id)
+  } catch (error) {
+    pushToast('error', '跨页全选失败', error.message)
+  } finally {
+    selectionBusy.value = ''
+  }
+}
 
 function bulkMessage(result, label) {
   const skipped = result.skipped?.length || 0
@@ -696,6 +819,12 @@ async function redeem() {
       body: JSON.stringify({ codes: publicCodes.value }),
     })
     redeemState.value = result
+    if (result.delivery_type === 'redelivery') {
+      redeemStage.value = result.message || 'CDK 已兑换，正在补发关联账号'
+      await download(`/redeliveries/${result.id}/download?token=${encodeURIComponent(result.task_token)}`)
+      redeemState.value = { ...result, status: 'redelivery_completed' }
+      return
+    }
     if (result.status === 'completed') {
       redeemStage.value = '正在准备下载'
       await download(`/redemptions/${result.id}/download?token=${encodeURIComponent(result.task_token)}`)
@@ -752,7 +881,7 @@ onMounted(async () => {
     <FormSection class="login-surface" title="CDK Loader" description="登录运营控制台以继续操作。" variant="outline" size="md">
       <div class="login-heading"><span class="login-icon"><LockKeyhole :size="21" /></span><div><strong>管理员登录</strong><small>受保护的工作区</small></div></div>
       <form @submit.prevent="login">
-        <FormField label="管理员密码"><NInput id="admin-password" v-model="loginPassword" type="password" placeholder="输入密码" block /></FormField>
+        <FormField label="管理员密码"><NInput id="admin-password" v-model="loginPassword" type="password" autocomplete="current-password" placeholder="输入密码" block /></FormField>
         <CalloutBox v-if="loginError" tone="error" variant="soft" size="sm">{{ loginError }}</CalloutBox>
         <NButton type="submit" variant="primary" size="md" block :disabled="loading"><LoaderCircle v-if="loading" :size="17" class="spin" /><ChevronRight v-else :size="17" />进入后台</NButton>
       </form>
@@ -766,7 +895,7 @@ onMounted(async () => {
         <span><b>CDK Loader</b><small>运营控制台</small></span>
       </button>
       <nav aria-label="管理导航">
-        <button v-for="item in navItems" :key="item.id" type="button" :class="['nav-item', { active: activeView === item.id }]" :aria-current="activeView === item.id ? 'page' : undefined" @click="activeView = item.id">
+        <button v-for="item in navItems" :key="item.id" type="button" :class="['nav-item', { active: activeView === item.id }]" :aria-current="activeView === item.id ? 'page' : undefined" :aria-label="item.label" :title="item.label" @click="activeView = item.id">
           <component :is="item.icon" :size="18" />
           <span>{{ item.label }}</span>
         </button>
@@ -798,31 +927,31 @@ onMounted(async () => {
 
       <section v-if="activeView === 'accounts'" class="workspace-section">
         <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
-          <template #end><div class="filter-group"><div class="search-field"><Search :size="15" /><NInput v-model="accountFilters.q" size="sm" placeholder="搜索账号、来源或 ID" aria-label="搜索账号" @keyup.enter="searchAccounts" /></div><FilterSelect v-model="accountFilters.has_refresh_token" :options="refreshTokenOptions" size="sm" aria-label="Refresh Token 筛选" @update:model-value="searchAccounts" /><FilterSelect v-model="accountFilters.status" :options="accountStatusOptions" size="sm" aria-label="账号状态筛选" @update:model-value="searchAccounts" /></div></template>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><NButton v-if="accountTotal > accounts.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy)" @click="toggleAllResults('accounts')"><LoaderCircle v-if="selectionBusy === 'accounts'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allAccountResultsSelected ? '取消全部选择' : `选择全部 ${accountTotal} 项` }}</NButton><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
+          <template #end><div class="filter-group"><span v-if="accountFilters.relation_label" class="relation-filter"><span :title="accountFilters.relation_label">{{ accountFilters.relation_label }}</span><NButton type="button" variant="outline" size="xs" icon-only title="清除关联筛选" @click="clearAccountRelationFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput v-model="accountFilters.q" size="sm" placeholder="搜索账号、来源或 ID" aria-label="搜索账号" @keyup.enter="searchAccounts" /></div><FilterSelect v-model="accountFilters.has_refresh_token" :options="refreshTokenOptions" size="sm" aria-label="Refresh Token 筛选" @update:model-value="searchAccounts" /><FilterSelect v-model="accountFilters.status" :options="accountStatusOptions" size="sm" aria-label="账号状态筛选" @update:model-value="searchAccounts" /></div></template>
         </ToolbarShell>
         <CalloutBox v-if="accountMessage" :tone="messageTone(accountMessage)" variant="soft" size="sm" class="section-message">{{ accountMessage }}</CalloutBox>
-        <TableShell class="data-table accounts-table" :show-empty="!accounts.length" :empty-colspan="6" empty-title="暂无账号" empty-description="导入账号后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allAccountsSelected" :indeterminate="selectedAccountsOnPage > 0 && !allAccountsSelected" aria-label="选择当前页账号" @update:model-value="toggleAllAccounts" /></th><th>账号</th><th>来源</th><th>凭据</th><th>验活时间</th><th>状态</th></tr></template><tr v-for="account in accounts" :key="account.id"><td class="selection-cell"><NCheckbox :model-value="selectedAccountIds.includes(account.id)" :aria-label="`选择 ${account.email}`" @update:model-value="toggleAccount(account.id, $event)" /></td><td><b>{{ account.email || '—' }}</b><small>{{ account.account_id || '—' }}</small></td><td>{{ account.source }}</td><td>{{ account.has_access_token ? 'AT' : '' }}{{ account.has_refresh_token ? ' · RT' : '' }}</td><td>{{ formatDate(account.validated_at) }}</td><td><StatusPill :label="statusLabel(account.status)" :tone="statusTone(account.status)" size="xs" radius="rounded" /></td></tr></TableShell>
+        <TableShell class="data-table accounts-table" :show-empty="!accounts.length" :empty-colspan="8" empty-title="暂无账号" empty-description="导入账号后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allAccountsSelected" :indeterminate="selectedAccountsOnPage > 0 && !allAccountsSelected" aria-label="选择当前页账号" @update:model-value="toggleAllAccounts" /></th><th>账号</th><th>关联 CDK</th><th>来源</th><th>凭据</th><th>时间（东八区）</th><th>状态</th><th class="action-cell">操作</th></tr></template><tr v-for="account in accounts" :key="account.id"><td class="selection-cell"><NCheckbox :model-value="selectedAccountIds.includes(account.id)" :aria-label="`选择 ${account.email}`" @update:model-value="toggleAccount(account.id, $event)" /></td><td><b>{{ account.email || '—' }}</b><small>{{ account.account_id || '—' }}</small></td><td class="relation-cell"><button v-if="account.related_cdk" class="relation-code" type="button" :title="`查看 ${cdkLabel(account.related_cdk)}`" @click="openCdkForAccount(account)">{{ cdkLabel(account.related_cdk) }}</button><small v-if="account.related_cdk">任务 {{ account.related_cdk.redemption_id.slice(0, 8) }}</small><span v-else>—</span></td><td>{{ account.source }}</td><td>{{ account.has_access_token ? 'AT' : '' }}{{ account.has_refresh_token ? ' · RT' : '' }}</td><td><b>{{ formatDate(account.delivered_at || account.validated_at) }}</b><small>{{ account.delivered_at ? '交付时间' : '验活时间' }}</small></td><td><StatusPill :label="statusLabel(account.status)" :tone="statusTone(account.status)" size="xs" radius="rounded" /></td><td class="action-cell"><NButton v-if="account.related_cdk" type="button" variant="outline" size="xs" icon-only title="二次导出账号" :disabled="accountExportBusy" @click="reexportAccount(account)"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" /></NButton><span v-else>—</span></td></tr></TableShell>
         <div v-if="accountTotal" class="pagination-bar" aria-label="账号池分页"><span>{{ pageRange(accountTotal, accountPage, accountPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="accountPageSize" :options="pageSizeOptions" size="sm" aria-label="账号池每页条数" @update:model-value="changeAccountPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="accountPage <= 1" @click="changeAccountPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ accountPage }} / {{ pageCount(accountTotal, accountPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="accountPage >= pageCount(accountTotal, accountPageSize)" @click="changeAccountPage(1)"><ChevronRight :size="15" /></NButton></div></div>
       </section>
 
       <section v-if="activeView === 'cdks'" class="workspace-section">
         <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ cdkTotal }}</strong><span>个 CDK</span></div><span v-if="selectedCdkIds.length" class="selection-count">已选择 {{ selectedCdkIds.length }} 项</span><NButton v-if="selectedCdkIds.length" type="button" variant="outline" size="xs" icon-only title="复制选中 CDK" @click="copySelectedCdks"><Clipboard :size="15" /></NButton><NButton v-if="selectedCdkIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中 CDK" @click="openDeleteDialog('cdks')"><Trash2 :size="15" /></NButton></div></template>
-          <template #end><div class="filter-group"><div class="search-field"><Search :size="15" /><NInput v-model="cdkFilters.q" size="sm" placeholder="搜索 CDK 前缀" aria-label="搜索 CDK" @keyup.enter="searchCdks" /></div><div class="quota-search-field"><Gauge :size="15" /><NInput v-model="cdkFilters.quota" size="sm" placeholder="额度：10 或 0/10" aria-label="按额度筛选 CDK" @keyup.enter="searchCdks" /></div><FilterSelect v-model="cdkFilters.status" :options="cdkStatusOptions" size="sm" aria-label="CDK 状态筛选" @update:model-value="searchCdks" /></div></template>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ cdkTotal }}</strong><span>个 CDK</span></div><NButton v-if="cdkTotal > cdks.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy)" @click="toggleAllResults('cdks')"><LoaderCircle v-if="selectionBusy === 'cdks'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allCdkResultsSelected ? '取消全部选择' : `选择全部 ${cdkTotal} 项` }}</NButton><span v-if="selectedCdkIds.length" class="selection-count">已选择 {{ selectedCdkIds.length }} 项</span><NButton v-if="selectedCdkIds.length" type="button" variant="outline" size="xs" icon-only title="复制选中 CDK" @click="copySelectedCdks"><Clipboard :size="15" /></NButton><NButton v-if="selectedCdkIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中 CDK" @click="openDeleteDialog('cdks')"><Trash2 :size="15" /></NButton></div></template>
+          <template #end><div class="filter-group"><div class="search-field"><Search :size="15" /><NInput v-model="cdkFilters.q" size="sm" placeholder="搜索完整 CDK 或前缀" aria-label="搜索 CDK" @keyup.enter="searchCdks" /></div><div class="quota-search-field"><Gauge :size="15" /><NInput v-model="cdkFilters.quota" size="sm" placeholder="额度：10 或 0/10" aria-label="按额度筛选 CDK" @keyup.enter="searchCdks" /></div><FilterSelect v-model="cdkFilters.status" :options="cdkStatusOptions" size="sm" aria-label="CDK 状态筛选" @update:model-value="searchCdks" /></div></template>
         </ToolbarShell>
         <CalloutBox v-if="cdkFilterMessage" tone="warning" variant="soft" size="sm" class="section-message">{{ cdkFilterMessage }}</CalloutBox>
-        <TableShell class="data-table" :show-empty="!cdks.length" :empty-colspan="8" empty-title="暂无 CDK" empty-description="生成 CDK 后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allCdksSelected" :indeterminate="selectedCdksOnPage > 0 && !allCdksSelected" aria-label="选择当前页 CDK" @update:model-value="toggleAllCdks" /></th><th>CDK</th><th>剩余 / 总额度</th><th>冻结</th><th>格式</th><th>有效期</th><th>状态</th><th class="action-cell">操作</th></tr></template><tr v-for="cdk in cdks" :key="cdk.id"><td class="selection-cell"><NCheckbox :model-value="selectedCdkIds.includes(cdk.id)" :aria-label="`选择 ${cdk.prefix}`" @update:model-value="toggleCdk(cdk.id, $event)" /></td><td><b>{{ cdk.code || `${cdk.prefix}-****` }}</b><small v-if="!cdk.code">历史明文不可恢复</small></td><td>{{ cdk.remaining_quota }} / {{ cdk.total_quota }}</td><td>{{ cdk.reserved_quota }}</td><td>{{ cdk.export_format.toUpperCase() }}</td><td>{{ cdk.expires_at ? formatDate(cdk.expires_at, 'date') : '长期' }}</td><td><StatusPill :label="statusLabel(cdk.status)" :tone="statusTone(cdk.status)" size="xs" radius="rounded" /></td><td class="action-cell"><NButton v-if="cdk.can_copy" type="button" variant="outline" size="xs" icon-only title="复制完整 CDK" @click="copySingleCdk(cdk.id)"><Clipboard :size="15" /></NButton><NButton v-else-if="cdk.status === 'unused' && cdk.remaining_quota === cdk.total_quota && cdk.reserved_quota === 0" type="button" variant="outline" size="xs" icon-only title="重新签发并复制" @click="openReissueDialog(cdk)"><RefreshCw :size="15" /></NButton><span v-else>—</span></td></tr></TableShell>
+        <TableShell class="data-table cdks-table" :show-empty="!cdks.length" :empty-colspan="9" empty-title="暂无 CDK" empty-description="生成 CDK 后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allCdksSelected" :indeterminate="selectedCdksOnPage > 0 && !allCdksSelected" aria-label="选择当前页 CDK" @update:model-value="toggleAllCdks" /></th><th>CDK</th><th>剩余 / 总额度</th><th>冻结</th><th>格式</th><th>有效期</th><th>已兑换账号</th><th>状态</th><th class="action-cell">操作</th></tr></template><tr v-for="cdk in cdks" :key="cdk.id"><td class="selection-cell"><NCheckbox :model-value="selectedCdkIds.includes(cdk.id)" :aria-label="`选择 ${cdk.prefix}`" @update:model-value="toggleCdk(cdk.id, $event)" /></td><td><b>{{ cdkLabel(cdk) }}</b><small v-if="!cdk.code">历史明文不可恢复</small></td><td>{{ cdk.remaining_quota }} / {{ cdk.total_quota }}</td><td>{{ cdk.reserved_quota }}</td><td>{{ cdk.export_format.toUpperCase() }}</td><td>{{ cdk.expires_at ? formatDate(cdk.expires_at, 'date') : '长期' }}</td><td class="relation-cell"><button v-if="cdk.delivery_count" class="relation-count" type="button" :title="`查看 ${cdkLabel(cdk)} 关联的账号`" @click="openAccountsForCdk(cdk)"><Users :size="14" /><span>{{ cdk.delivery_count }} 个账号</span></button><span v-else>—</span></td><td><StatusPill :label="statusLabel(cdk.status)" :tone="statusTone(cdk.status)" size="xs" radius="rounded" /></td><td class="action-cell"><NButton v-if="cdk.can_copy" type="button" variant="outline" size="xs" icon-only title="复制完整 CDK" @click="copySingleCdk(cdk.id)"><Clipboard :size="15" /></NButton><NButton v-else-if="cdk.status === 'unused' && cdk.remaining_quota === cdk.total_quota && cdk.reserved_quota === 0" type="button" variant="outline" size="xs" icon-only title="重新签发并复制" @click="openReissueDialog(cdk)"><RefreshCw :size="15" /></NButton><span v-else>—</span></td></tr></TableShell>
         <div v-if="cdkTotal" class="pagination-bar" aria-label="CDK 分页"><span>{{ pageRange(cdkTotal, cdkPage, cdkPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="cdkPageSize" :options="pageSizeOptions" size="sm" aria-label="CDK 每页条数" @update:model-value="changeCdkPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="cdkPage <= 1" @click="changeCdkPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ cdkPage }} / {{ pageCount(cdkTotal, cdkPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="cdkPage >= pageCount(cdkTotal, cdkPageSize)" @click="changeCdkPage(1)"><ChevronRight :size="15" /></NButton></div></div>
       </section>
 
       <section v-if="activeView === 'redemptions'" class="workspace-section">
         <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ redemptionTotal }}</strong><span>条记录</span></div><span v-if="selectedRedemptionIds.length" class="selection-count">已选择 {{ selectedRedemptionIds.length }} 项</span><NButton v-if="selectedRedemptionIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中兑换记录" @click="openDeleteDialog('redemptions')"><Trash2 :size="15" /></NButton></div></template>
-          <template #end><div class="filter-group"><span v-if="redemptionFilters.today" class="today-filter"><StatusPill label="仅今天" tone="info" size="xs" radius="rounded" /><NButton type="button" variant="outline" size="xs" icon-only title="清除今日筛选" @click="clearTodayRedemptionFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput v-model="redemptionFilters.q" size="sm" placeholder="搜索任务 ID 或 CDK 前缀" aria-label="搜索兑换记录" @keyup.enter="searchRedemptions" /></div><FilterSelect v-model="redemptionFilters.status" :options="redemptionStatusOptions" size="sm" aria-label="兑换状态筛选" @update:model-value="searchRedemptions" /></div></template>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ redemptionTotal }}</strong><span>条记录</span></div><NButton v-if="redemptionTotal > redemptions.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy)" @click="toggleAllResults('redemptions')"><LoaderCircle v-if="selectionBusy === 'redemptions'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allRedemptionResultsSelected ? '取消全部选择' : `选择全部 ${redemptionTotal} 项` }}</NButton><span v-if="selectedRedemptionIds.length" class="selection-count">已选择 {{ selectedRedemptionIds.length }} 项</span><NButton v-if="selectedRedemptionIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中兑换记录" @click="openDeleteDialog('redemptions')"><Trash2 :size="15" /></NButton></div></template>
+          <template #end><div class="filter-group"><span v-if="redemptionFilters.today" class="today-filter"><StatusPill label="仅今天" tone="info" size="xs" radius="rounded" /><NButton type="button" variant="outline" size="xs" icon-only title="清除今日筛选" @click="clearTodayRedemptionFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput v-model="redemptionFilters.q" size="sm" placeholder="搜索任务 ID 或完整 CDK" aria-label="搜索兑换记录" @keyup.enter="searchRedemptions" /></div><FilterSelect v-model="redemptionFilters.status" :options="redemptionStatusOptions" size="sm" aria-label="兑换状态筛选" @update:model-value="searchRedemptions" /></div></template>
         </ToolbarShell>
         <CalloutBox v-if="redemptionMessage" :tone="messageTone(redemptionMessage)" variant="soft" size="sm" class="section-message">{{ redemptionMessage }}</CalloutBox>
-        <TableShell class="data-table" :show-empty="!redemptions.length" :empty-colspan="6" empty-title="暂无兑换记录" empty-description="用户兑换后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allRedemptionsSelected" :indeterminate="selectedRedemptionsOnPage > 0 && !allRedemptionsSelected" aria-label="选择当前页兑换记录" @update:model-value="toggleAllRedemptions" /></th><th>任务</th><th>CDK</th><th>请求 / 交付</th><th>创建时间</th><th>状态</th></tr></template><tr v-for="item in redemptions" :key="item.id"><td class="selection-cell"><NCheckbox :model-value="selectedRedemptionIds.includes(item.id)" :aria-label="`选择兑换任务 ${item.id.slice(0, 8)}`" @update:model-value="toggleRedemption(item.id, $event)" /></td><td><b>{{ item.id.slice(0, 8) }}</b><small>{{ item.error_message || '—' }}</small></td><td>{{ item.cdks.map((cdk) => cdk.prefix).join(', ') || '—' }}</td><td>{{ item.requested_count }} / {{ item.delivered_count }}</td><td>{{ formatDate(item.created_at) }}</td><td><StatusPill :label="statusLabel(item.status)" :tone="statusTone(item.status)" size="xs" radius="rounded" /></td></tr></TableShell>
+        <TableShell class="data-table redemptions-table" :show-empty="!redemptions.length" :empty-colspan="6" empty-title="暂无兑换记录" empty-description="用户兑换后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allRedemptionsSelected" :indeterminate="selectedRedemptionsOnPage > 0 && !allRedemptionsSelected" aria-label="选择当前页兑换记录" @update:model-value="toggleAllRedemptions" /></th><th>任务</th><th>CDK</th><th>请求 / 交付</th><th>创建时间（东八区）</th><th>状态</th></tr></template><tr v-for="item in redemptions" :key="item.id"><td class="selection-cell"><NCheckbox :model-value="selectedRedemptionIds.includes(item.id)" :aria-label="`选择兑换任务 ${item.id.slice(0, 8)}`" @update:model-value="toggleRedemption(item.id, $event)" /></td><td><b>{{ item.id.slice(0, 8) }}</b><small>{{ item.error_message || '—' }}</small></td><td class="relation-cell"><div class="relation-stack"><button v-for="cdk in item.cdks" :key="cdk.id" class="relation-code" type="button" :title="`查看 ${cdkLabel(cdk)} 关联的账号`" @click="openAccountsForCdk(cdk)">{{ cdkLabel(cdk) }}</button><span v-if="!item.cdks.length">—</span></div></td><td><div class="delivery-summary"><span>{{ item.requested_count }} / {{ item.delivered_count }}</span><button v-if="item.delivered_count" class="relation-count" type="button" title="查看本次兑换交付的账号" @click="openAccountsForRedemption(item)"><Users :size="14" /><span>查看账号</span></button></div></td><td>{{ formatDate(item.created_at) }}</td><td><StatusPill :label="statusLabel(item.status)" :tone="statusTone(item.status)" size="xs" radius="rounded" /></td></tr></TableShell>
         <div v-if="redemptionTotal" class="pagination-bar" aria-label="兑换记录分页"><span>{{ pageRange(redemptionTotal, redemptionPage, redemptionPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="redemptionPageSize" :options="pageSizeOptions" size="sm" aria-label="兑换记录每页条数" @update:model-value="changeRedemptionPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="redemptionPage <= 1" @click="changeRedemptionPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ redemptionPage }} / {{ pageCount(redemptionTotal, redemptionPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="redemptionPage >= pageCount(redemptionTotal, redemptionPageSize)" @click="changeRedemptionPage(1)"><ChevronRight :size="15" /></NButton></div></div>
       </section>
     </main>
