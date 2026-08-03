@@ -10,10 +10,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from ..dependencies import get_db
-from ..models import Redemption, RedemptionCDK, utcnow
+from ..models import Redelivery, Redemption, RedemptionCDK, utcnow
 from ..schemas import RedemptionCreateRequest
-from ..services.exporter import build_download
-from ..services.redemption import RedemptionError, RedemptionService, serialize_redemption
+from ..services.exporter import build_download, build_redelivery_download
+from ..services.redemption import RedemptionError, RedemptionService, serialize_redelivery, serialize_redemption
 
 
 router = APIRouter(prefix="/api/v1", tags=["public"])
@@ -27,10 +27,24 @@ def _load_redemption(db: Session, redemption_id: str) -> Redemption | None:
     )
 
 
+def _load_redelivery(db: Session, redelivery_id: str) -> Redelivery | None:
+    return db.scalar(
+        select(Redelivery)
+        .options(selectinload(Redelivery.items))
+        .where(Redelivery.id == redelivery_id)
+    )
+
+
 def _ensure_task_token(request: Request, redemption: Redemption, task_token: str) -> None:
     expected = request.app.state.security.redemption_token(redemption.id, redemption.idempotency_key)
     if not task_token or not request.app.state.security.constant_time_equal(task_token, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="任务凭证无效")
+
+
+def _ensure_redelivery_token(request: Request, redelivery: Redelivery, task_token: str) -> None:
+    expected = request.app.state.security.redelivery_token(redelivery.id, redelivery.idempotency_key)
+    if not task_token or not request.app.state.security.constant_time_equal(task_token, expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="补发凭证无效")
 
 
 def _schedule_task(request: Request, redemption_id: str) -> None:
@@ -63,11 +77,19 @@ async def create_redemption(
             idempotency_key=idempotency_key,
             client_ip=request.client.host if request.client else "unknown",
         )
-        db.commit()
     except RedemptionError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": exc.message, "details": exc.details}) from exc
 
+    if isinstance(redemption, Redelivery):
+        db.commit()
+        db.expire_all()
+        current_redelivery = _load_redelivery(db, redemption.id)
+        if not current_redelivery:
+            raise HTTPException(status_code=500, detail="补发任务创建失败")
+        return JSONResponse(status_code=200, content=serialize_redelivery(current_redelivery, request.app.state.security))
+
+    db.commit()
     wait_requested = bool(prefer and "wait=3" in prefer)
     if redemption.status == "queued" and wait_requested:
         task = asyncio.create_task(asyncio.to_thread(service.process, redemption.id))
@@ -162,3 +184,41 @@ def download_redemption(
         },
     )
 
+
+@router.get("/redeliveries/{redelivery_id}/download")
+def download_redelivery(
+    redelivery_id: str,
+    request: Request,
+    task_token: str = Query(alias="token"),
+    db: Session = Depends(get_db),
+):
+    redelivery = db.scalar(select(Redelivery).where(Redelivery.id == redelivery_id).with_for_update())
+    if not redelivery:
+        raise HTTPException(status_code=404, detail="补发任务不存在")
+    _ensure_redelivery_token(request, redelivery, task_token)
+    if redelivery.status == "downloaded" or redelivery.downloaded_at:
+        raise HTTPException(status_code=410, detail="补发下载链接已使用")
+    if redelivery.status == "expired" or redelivery.recovery_expires_at <= utcnow():
+        redelivery.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=410, detail="CDK 已兑换，补发时效已过，请联系管理员")
+    if redelivery.status != "ready":
+        raise HTTPException(status_code=409, detail="关联账号已不可用，无法补发")
+    try:
+        content, filename, media_type = build_redelivery_download(db, redelivery_id, request.app.state.security)
+    except ValueError as exc:
+        redelivery.status = "unavailable"
+        db.commit()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    redelivery.status = "downloaded"
+    redelivery.downloaded_at = utcnow()
+    db.commit()
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, private",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

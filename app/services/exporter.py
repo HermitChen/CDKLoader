@@ -6,13 +6,15 @@ import json
 import re
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from ..models import Account, CDK, DeliveryItem, Redemption, RedemptionCDK
+from ..models import Account, DeliveryItem, Redelivery, Redemption, RedemptionCDK, utcnow
 from ..security import SecurityManager
+from ..time import china_now, to_china_iso
 
 
 ALL_EXPORT_FIELDS = {
@@ -45,8 +47,18 @@ DEFAULT_EXPORT_FIELDS = [
 ]
 
 
+@dataclass
+class ExportDelivery:
+    account: Account
+    cdk_id: str
+    cdk_prefix: str
+    export_format: str
+    export_fields: str
+    ordinal: int
+
+
 def _date_value(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    return to_china_iso(value)
 
 
 def serialize_account(account, security: SecurityManager, fields: list[str]) -> dict:
@@ -158,9 +170,9 @@ def _render_sub2api(account, security: SecurityManager) -> bytes:
     extra = values["extra"]
     expires_in = 0
     if account.expires_at:
-        expires_in = max(0, int((account.expires_at - datetime.now()).total_seconds()))
+        expires_in = max(0, int((account.expires_at - utcnow()).total_seconds()))
     payload = {
-        "exported_at": f"{datetime.now().isoformat(timespec='milliseconds')}Z",
+        "exported_at": china_now().isoformat(timespec="milliseconds"),
         "proxies": [],
         "accounts": [{
             "name": values["email"],
@@ -213,7 +225,7 @@ def _archive_stem(account, index: int, used: set[str]) -> str:
 
 
 def _timestamped_zip_filename() -> str:
-    return f"accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    return f"accounts_{china_now().strftime('%Y%m%d_%H%M%S')}.zip"
 
 
 def build_account_archive(
@@ -235,39 +247,32 @@ def build_account_archive(
     return buffer.getvalue(), _timestamped_zip_filename(), "application/zip"
 
 
-def build_download(session: Session, redemption_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
-    redemption = session.scalar(
-        select(Redemption)
-        .options(joinedload(Redemption.cdks).joinedload(RedemptionCDK.cdk))
-        .where(Redemption.id == redemption_id)
-    )
-    if not redemption:
-        raise ValueError("兑换任务不存在")
-    items = session.scalars(
-        select(DeliveryItem)
-        .options(joinedload(DeliveryItem.account), joinedload(DeliveryItem.cdk))
-        .where(DeliveryItem.redemption_id == redemption_id)
-        .order_by(DeliveryItem.id)
-    ).all()
-    grouped: dict[str, list] = defaultdict(list)
-    deliveries_by_cdk: dict[str, list[DeliveryItem]] = defaultdict(list)
-    cdk_by_id: dict[str, CDK] = {}
-    for item in items:
-        grouped[item.cdk_id].append(item.account)
-        deliveries_by_cdk[item.cdk_id].append(item)
-        cdk_by_id[item.cdk_id] = item.cdk
+def _export_fields(value: str) -> list[str]:
+    try:
+        fields = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return fields if isinstance(fields, list) else []
 
+
+def _build_delivery_download(deliveries: list[ExportDelivery], security: SecurityManager) -> tuple[bytes, str, str]:
+    if not deliveries:
+        raise ValueError("没有可导出的关联账号")
+    deliveries_by_cdk: defaultdict[str, list[ExportDelivery]] = defaultdict(list)
+    cdk_settings: dict[str, ExportDelivery] = {}
+    for delivery in sorted(deliveries, key=lambda item: item.ordinal):
+        deliveries_by_cdk[delivery.cdk_id].append(delivery)
+        cdk_settings.setdefault(delivery.cdk_id, delivery)
     rendered: list[tuple[str, bytes]] = []
-    json_items: list[DeliveryItem] = []
-    for relation in sorted(redemption.cdks, key=lambda item: item.ordinal):
-        cdk = cdk_by_id.get(relation.cdk_id) or relation.cdk
-        if cdk.export_format == "json":
-            json_items.extend(deliveries_by_cdk.get(cdk.id, []))
+    json_items: list[ExportDelivery] = []
+    for cdk_id, settings in sorted(cdk_settings.items(), key=lambda item: item[1].ordinal):
+        if settings.export_format == "json":
+            json_items.extend(deliveries_by_cdk[cdk_id])
             continue
-        fields = json.loads(cdk.export_fields or "[]")
-        records = [serialize_account(account, security, fields) for account in grouped.get(cdk.id, [])]
-        body, extension, media_type = _render(records, cdk.export_format)
-        rendered.append((f"accounts_{cdk.code_prefix}.{extension}", body))
+        fields = _export_fields(settings.export_fields)
+        records = [serialize_account(item.account, security, fields) for item in deliveries_by_cdk[cdk_id]]
+        body, extension, _ = _render(records, settings.export_format)
+        rendered.append((f"accounts_{settings.cdk_prefix}.{extension}", body))
 
     if json_items:
         return build_account_archive([item.account for item in json_items], security, rendered)
@@ -283,3 +288,64 @@ def build_download(session: Session, redemption_id: str, security: SecurityManag
         for filename, content in rendered:
             archive.writestr(filename, content)
     return buffer.getvalue(), _timestamped_zip_filename(), "application/zip"
+
+
+def build_download(session: Session, redemption_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+    redemption = session.scalar(
+        select(Redemption)
+        .options(joinedload(Redemption.cdks).joinedload(RedemptionCDK.cdk))
+        .where(Redemption.id == redemption_id)
+    )
+    if not redemption:
+        raise ValueError("兑换任务不存在")
+    items = session.scalars(
+        select(DeliveryItem)
+        .options(joinedload(DeliveryItem.account), joinedload(DeliveryItem.cdk))
+        .where(DeliveryItem.redemption_id == redemption_id)
+        .order_by(DeliveryItem.id)
+    ).all()
+    deliveries_by_cdk: defaultdict[str, list[DeliveryItem]] = defaultdict(list)
+    for item in items:
+        deliveries_by_cdk[item.cdk_id].append(item)
+    export_deliveries: list[ExportDelivery] = []
+    for relation in sorted(redemption.cdks, key=lambda item: item.ordinal):
+        cdk = relation.cdk
+        for index, item in enumerate(deliveries_by_cdk.get(cdk.id, [])):
+            export_deliveries.append(
+                ExportDelivery(
+                    account=item.account,
+                    cdk_id=cdk.id,
+                    cdk_prefix=cdk.code_prefix,
+                    export_format=cdk.export_format,
+                    export_fields=cdk.export_fields or "[]",
+                    ordinal=relation.ordinal * 100_000 + index,
+                )
+            )
+    return _build_delivery_download(export_deliveries, security)
+
+
+def build_redelivery_download(session: Session, redelivery_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+    redelivery = session.scalar(
+        select(Redelivery).options(selectinload(Redelivery.items)).where(Redelivery.id == redelivery_id)
+    )
+    if not redelivery:
+        raise ValueError("补发任务不存在")
+    if not redelivery.items:
+        raise ValueError("关联交付记录已删除，无法补发")
+    account_ids = {item.account_id for item in redelivery.items}
+    accounts = session.scalars(select(Account).where(Account.id.in_(account_ids))).all()
+    accounts_by_id = {account.id: account for account in accounts}
+    if len(accounts_by_id) != len(account_ids):
+        raise ValueError("关联账号已删除，无法补发")
+    export_deliveries = [
+        ExportDelivery(
+            account=accounts_by_id[item.account_id],
+            cdk_id=item.cdk_id,
+            cdk_prefix=item.cdk_prefix,
+            export_format=item.export_format,
+            export_fields=item.export_fields or "[]",
+            ordinal=item.ordinal,
+        )
+        for item in redelivery.items
+    ]
+    return _build_delivery_download(export_deliveries, security)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -14,7 +14,7 @@ def new_id() -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class AccountImport(Base):
@@ -166,6 +166,42 @@ class RedemptionCDK(Base):
     cdk: Mapped[CDK] = relationship()
 
     __table_args__ = (UniqueConstraint("redemption_id", "cdk_id", name="uq_redemption_cdk"),)
+
+
+class Redelivery(Base):
+    __tablename__ = "redeliveries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="ready", index=True)
+    input_count: Mapped[int] = mapped_column(Integer, default=0)
+    delivered_count: Mapped[int] = mapped_column(Integer, default=0)
+    client_ip_hash: Mapped[str] = mapped_column(String(64), default="")
+    recovery_expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    items: Mapped[list["RedeliveryItem"]] = relationship(
+        back_populates="redelivery", cascade="all, delete-orphan", order_by="RedeliveryItem.ordinal"
+    )
+
+
+class RedeliveryItem(Base):
+    __tablename__ = "redelivery_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    redelivery_id: Mapped[str] = mapped_column(ForeignKey("redeliveries.id", ondelete="CASCADE"), index=True)
+    source_redemption_id: Mapped[str] = mapped_column(ForeignKey("redemptions.id", ondelete="CASCADE"), index=True)
+    cdk_id: Mapped[str] = mapped_column(ForeignKey("cdks.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), index=True)
+    cdk_prefix: Mapped[str] = mapped_column(String(16))
+    export_format: Mapped[str] = mapped_column(String(16), default="json")
+    export_fields: Mapped[str] = mapped_column(Text, default="[]")
+    ordinal: Mapped[int] = mapped_column(Integer)
+
+    redelivery: Mapped[Redelivery] = relationship(back_populates="items")
+
+    __table_args__ = (UniqueConstraint("redelivery_id", "account_id", name="uq_redelivery_account"),)
 
 
 class DeliveryItem(Base):

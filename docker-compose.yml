@@ -2,7 +2,7 @@ name: cdkloader
 
 services:
   cdkloader:
-    image: "${CDK_LOADER_IMAGE:-ghcr.io/hermitchen/cdkloader:20260801}"
+    image: "${CDK_LOADER_IMAGE:-ghcr.io/hermitchen/cdkloader:latest}"
     ports:
       - "${CDK_LOADER_PORT:-1456}:1456"
     environment:
@@ -15,6 +15,7 @@ services:
       VALIDATION_TIMEOUT_SECONDS: "${VALIDATION_TIMEOUT_SECONDS:-5}"
       VALIDATION_ATTEMPTS: "${VALIDATION_ATTEMPTS:-2}"
       VALIDATION_CONCURRENCY: "${VALIDATION_CONCURRENCY:-6}"
+      REDELIVERY_WINDOW_SECONDS: "${REDELIVERY_WINDOW_SECONDS:-1800}"
       PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:1456}"
     volumes:
       - ./data:/app/data

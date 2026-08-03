@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
@@ -18,6 +17,7 @@ from ..services.importers import ImportParseException, parse_import_file
 from ..services.exporter import build_account_archive
 from ..services.redemption import refresh_cdk_status, serialize_redemption
 from ..services.validator import apply_validation
+from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
 
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
@@ -30,33 +30,52 @@ def _generate_cdk() -> str:
     return "CDK-" + "-".join(groups)
 
 
-def _serialize_cdk(cdk: CDK, security: SecurityManager | None = None) -> dict:
+def _cdk_code(cdk: CDK, security: SecurityManager | None = None) -> str | None:
+    if not security or not cdk.code_encrypted:
+        return None
+    try:
+        return security.decrypt(cdk.code_encrypted)
+    except Exception:
+        return None
+
+
+def _serialize_cdk(
+    cdk: CDK,
+    security: SecurityManager | None = None,
+    *,
+    delivery_count: int = 0,
+) -> dict:
     refresh_cdk_status(cdk)
-    code = None
-    if security and cdk.code_encrypted:
-        try:
-            code = security.decrypt(cdk.code_encrypted)
-        except Exception:
-            code = None
     return {
         "id": cdk.id,
-        "code": code,
+        "code": _cdk_code(cdk, security),
         "prefix": cdk.code_prefix,
         "total_quota": cdk.total_quota,
         "remaining_quota": cdk.remaining_quota,
         "reserved_quota": cdk.reserved_quota,
         "status": cdk.status,
-        "expires_at": cdk.expires_at.isoformat() if cdk.expires_at else None,
+        "expires_at": to_china_iso(cdk.expires_at),
         "account_source": cdk.account_source,
         "registration_mode": cdk.registration_mode,
         "export_format": cdk.export_format,
         "export_fields": json.loads(cdk.export_fields or "[]"),
         "can_copy": bool(cdk.code_encrypted),
-        "created_at": cdk.created_at.isoformat(),
+        "created_at": to_china_iso(cdk.created_at),
+        "delivery_count": delivery_count,
     }
 
 
-def _serialize_account(account: Account) -> dict:
+def _serialize_account(account: Account, security: SecurityManager) -> dict:
+    delivery_item = account.delivery_item
+    related_cdk = None
+    if delivery_item and delivery_item.cdk:
+        related_cdk = {
+            "id": delivery_item.cdk.id,
+            "code": _cdk_code(delivery_item.cdk, security),
+            "prefix": delivery_item.cdk.code_prefix,
+            "redemption_id": delivery_item.redemption_id,
+            "delivered_at": to_china_iso(delivery_item.delivered_at),
+        }
     return {
         "id": account.id,
         "email": account.email,
@@ -67,10 +86,19 @@ def _serialize_account(account: Account) -> dict:
         "status": account.status,
         "has_access_token": bool(account.access_token_encrypted),
         "has_refresh_token": bool(account.refresh_token_encrypted),
-        "validated_at": account.validated_at.isoformat() if account.validated_at else None,
-        "delivered_at": account.delivered_at.isoformat() if account.delivered_at else None,
-        "created_at": account.created_at.isoformat(),
+        "validated_at": to_china_iso(account.validated_at),
+        "delivered_at": to_china_iso(account.delivered_at),
+        "created_at": to_china_iso(account.created_at),
+        "related_cdk": related_cdk,
     }
+
+
+def _cdk_search_condition(db: Session, security: SecurityManager, term: str):
+    digest = security.cdk_digest(term)
+    exact_match = db.scalar(select(CDK.id).where(CDK.code_hmac == digest).limit(1))
+    if exact_match:
+        return CDK.code_hmac == digest
+    return CDK.code_prefix.ilike(f"%{term}%")
 
 
 @router.post("/auth/login")
@@ -87,8 +115,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     def count_accounts(current_status: str) -> int:
         return int(db.scalar(select(func.count()).select_from(Account).where(Account.status == current_status)) or 0)
 
-    day_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
+    day_start, day_end = china_day_bounds_utc()
     return {
         "accounts": {
             "available": count_accounts("available"),
@@ -178,25 +205,40 @@ def get_account_import(import_id: str, db: Session = Depends(get_db)):
 @router.get("/accounts", dependencies=[Depends(require_admin)])
 def list_accounts(
     db: Session = Depends(get_db),
+    security: SecurityManager = Depends(get_security),
     current_status: str | None = Query(default=None, alias="status"),
     has_refresh_token: bool | None = Query(default=None),
     q: str | None = Query(default=None, max_length=320),
+    cdk_id: str | None = Query(default=None, max_length=36),
+    redemption_id: str | None = Query(default=None, max_length=36),
     limit: int = Query(default=15, ge=0, le=200),
     offset: int = Query(default=0, ge=0),
 ):
-    query = _account_query(current_status, has_refresh_token, q)
+    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id)
     total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     if limit == 0:
         offset = 0
-    accounts_query = query.offset(offset)
+    accounts_query = query.options(selectinload(Account.delivery_item).selectinload(DeliveryItem.cdk)).offset(offset)
     if limit:
         accounts_query = accounts_query.limit(limit)
     accounts = db.scalars(accounts_query).all()
-    return {"total": total, "items": [_serialize_account(item) for item in accounts]}
+    return {"total": total, "items": [_serialize_account(item, security) for item in accounts]}
 
 
-def _account_query(current_status: str | None, has_refresh_token: bool | None, q: str | None):
-    query = select(Account).order_by(Account.created_at.desc())
+def _account_query(
+    current_status: str | None,
+    has_refresh_token: bool | None,
+    q: str | None,
+    cdk_id: str | None = None,
+    redemption_id: str | None = None,
+):
+    query = select(Account)
+    if cdk_id or redemption_id:
+        query = query.join(Account.delivery_item)
+    if cdk_id:
+        query = query.where(DeliveryItem.cdk_id == cdk_id)
+    if redemption_id:
+        query = query.where(DeliveryItem.redemption_id == redemption_id)
     if current_status:
         query = query.where(Account.status == current_status)
     if has_refresh_token is True:
@@ -214,7 +256,7 @@ def _account_query(current_status: str | None, has_refresh_token: bool | None, q
                 Account.registration_mode.ilike(pattern),
             )
         )
-    return query
+    return query.order_by(Account.created_at.desc())
 
 
 @router.post("/accounts/export", dependencies=[Depends(require_admin)])
@@ -280,7 +322,7 @@ def validate_accounts(payload: AccountValidateRequest, request: Request, backgro
 
 @router.post("/cdks/generate", dependencies=[Depends(require_admin)])
 def generate_cdks(payload: CDKGenerateRequest, db: Session = Depends(get_db), security: SecurityManager = Depends(get_security)):
-    if payload.expires_at and payload.expires_at.replace(tzinfo=None) <= utcnow():
+    if payload.expires_at and to_utc_naive(payload.expires_at) <= utcnow():
         raise HTTPException(status_code=400, detail="有效期必须晚于当前时间")
     codes: list[str] = []
     items: list[CDK] = []
@@ -298,7 +340,7 @@ def generate_cdks(payload: CDKGenerateRequest, db: Session = Depends(get_db), se
             code_prefix="-".join(code.split("-")[:2]),
             total_quota=payload.quota,
             remaining_quota=payload.quota,
-            expires_at=payload.expires_at.replace(tzinfo=None) if payload.expires_at else None,
+            expires_at=to_utc_naive(payload.expires_at) if payload.expires_at else None,
             account_source=payload.account_source,
             registration_mode=payload.registration_mode,
             export_format=payload.export_format,
@@ -330,7 +372,7 @@ def import_cdks(payload: CDKImportRequest, db: Session = Depends(get_db), securi
                 code_prefix="-".join(code.split("-")[:2])[:16],
                 total_quota=payload.quota,
                 remaining_quota=payload.quota,
-                expires_at=payload.expires_at.replace(tzinfo=None) if payload.expires_at else None,
+                expires_at=to_utc_naive(payload.expires_at) if payload.expires_at else None,
             )
         )
         created += 1
@@ -352,7 +394,7 @@ def list_cdks(
     if current_status:
         query = query.where(CDK.status == current_status)
     if q and (term := q.strip().upper()):
-        query = query.where(CDK.code_prefix.ilike(f"%{term}%"))
+        query = query.where(_cdk_search_condition(db, security, term))
     if quota:
         term = quota.strip()
         if "/" in term:
@@ -371,7 +413,19 @@ def list_cdks(
     if limit:
         items_query = items_query.limit(limit)
     items = db.scalars(items_query).all()
-    return {"total": total, "items": [_serialize_cdk(item, security) for item in items]}
+    delivery_counts: dict[str, int] = {}
+    if items:
+        delivery_counts = dict(
+            db.execute(
+                select(DeliveryItem.cdk_id, func.count(DeliveryItem.id))
+                .where(DeliveryItem.cdk_id.in_([item.id for item in items]))
+                .group_by(DeliveryItem.cdk_id)
+            ).all()
+        )
+    return {
+        "total": total,
+        "items": [_serialize_cdk(item, security, delivery_count=delivery_counts.get(item.id, 0)) for item in items],
+    }
 
 
 @router.post("/cdks/copy", dependencies=[Depends(require_admin)])
@@ -493,14 +547,14 @@ def list_redemptions(
 ):
     query = select(Redemption).options(selectinload(Redemption.cdks).selectinload(RedemptionCDK.cdk))
     if today:
-        day_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        query = query.where(Redemption.created_at >= day_start, Redemption.created_at < day_start + timedelta(days=1))
+        day_start, day_end = china_day_bounds_utc()
+        query = query.where(Redemption.created_at >= day_start, Redemption.created_at < day_end)
     if current_status:
         query = query.where(Redemption.status == current_status)
-    if q and (term := q.strip()):
+    if q and (term := q.strip().upper()):
         pattern = f"%{term}%"
         query = query.outerjoin(RedemptionCDK).outerjoin(CDK).where(
-            or_(Redemption.id.ilike(pattern), CDK.code_prefix.ilike(pattern))
+            or_(Redemption.id.ilike(pattern), _cdk_search_condition(db, request.app.state.security, term))
         ).distinct()
     total = int(db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
     if limit == 0:
@@ -509,7 +563,10 @@ def list_redemptions(
     if limit:
         items_query = items_query.limit(limit)
     items = db.scalars(items_query).unique().all()
-    return {"total": total, "items": [serialize_redemption(item, request.app.state.security) for item in items]}
+    return {
+        "total": total,
+        "items": [serialize_redemption(item, request.app.state.security, include_cdk_codes=True) for item in items],
+    }
 
 
 @router.post("/redemptions/bulk-delete", dependencies=[Depends(require_admin)])

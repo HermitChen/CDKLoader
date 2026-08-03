@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..models import Account, AccountImport, AccountImportError, utcnow
 from ..security import SecurityManager, mask_email, token_hint
+from ..time import to_china_iso
 from .importers import ParseError, ParsedAccount, ParsedBatch
 from .validator import TokenValidator, apply_validation
 
@@ -256,8 +257,8 @@ def serialize_import(account_import: AccountImport, errors: list[AccountImportEr
         "valid_count": account_import.valid_count,
         "invalid_count": account_import.invalid_count,
         "inconclusive_count": account_import.inconclusive_count,
-        "created_at": account_import.created_at.isoformat(),
-        "completed_at": account_import.completed_at.isoformat() if account_import.completed_at else None,
+        "created_at": to_china_iso(account_import.created_at),
+        "completed_at": to_china_iso(account_import.completed_at),
     }
     if errors is not None:
         payload["errors"] = [AccountImportService._serialize_error(item) for item in errors]

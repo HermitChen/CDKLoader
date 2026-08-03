@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import zipfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.models import Account, CDK, DeliveryItem, Redemption, RedemptionCDK, utcnow
+from app.time import china_day_bounds_utc, to_china_iso
 
 from test_workflows import _generate_cdks, _import_accounts
 
@@ -346,3 +347,100 @@ def test_today_redemption_filter_excludes_earlier_records(client, admin_headers)
     dashboard = client.get("/api/v1/admin/dashboard", headers=admin_headers)
     assert dashboard.status_code == 200
     assert dashboard.json()["today_redemptions"] == 1
+
+
+def test_full_cdk_search_and_delivery_trace_support_reexport(client, admin_headers):
+    exact_codes = ["CDK-TRACE-AAAA-BBBB-CCCC", "CDK-TRACE-DDDD-EEEE-FFFF"]
+    imported = client.post(
+        "/api/v1/admin/cdks/import",
+        headers=admin_headers,
+        json={"codes": exact_codes, "quota": 1},
+    )
+    assert imported.status_code == 200, imported.text
+
+    exact_match = client.get(
+        "/api/v1/admin/cdks",
+        headers=admin_headers,
+        params={"q": exact_codes[0]},
+    )
+    assert exact_match.status_code == 200
+    assert exact_match.json()["total"] == 1
+    assert exact_match.json()["items"][0]["code"] == exact_codes[0]
+
+    _import_accounts(client, admin_headers, count=1)
+    delivered_code = _generate_cdks(client, admin_headers, count=1)[0]
+    redeemed = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "delivery-trace", "Prefer": "wait=3"},
+        json={"codes": [delivered_code]},
+    )
+    assert redeemed.status_code == 200, redeemed.text
+    public_record = redeemed.json()
+    assert public_record["cdks"][0]["code"] is None
+
+    cdk_result = client.get(
+        "/api/v1/admin/cdks",
+        headers=admin_headers,
+        params={"q": delivered_code},
+    )
+    assert cdk_result.status_code == 200
+    cdk = cdk_result.json()["items"][0]
+    assert cdk["code"] == delivered_code
+    assert cdk["delivery_count"] == 1
+
+    accounts_by_cdk = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"cdk_id": cdk["id"]},
+    )
+    assert accounts_by_cdk.status_code == 200
+    assert accounts_by_cdk.json()["total"] == 1
+    account = accounts_by_cdk.json()["items"][0]
+    assert account["related_cdk"]["code"] == delivered_code
+    assert account["related_cdk"]["redemption_id"] == public_record["id"]
+    assert account["created_at"].endswith("+08:00")
+
+    reexported = client.post(
+        "/api/v1/admin/accounts/export",
+        headers=admin_headers,
+        json={"ids": [account["id"]]},
+    )
+    assert reexported.status_code == 200, reexported.text
+    assert reexported.headers["content-type"] == "application/zip"
+
+    redemptions = client.get(
+        "/api/v1/admin/redemptions",
+        headers=admin_headers,
+        params={"q": delivered_code},
+    )
+    assert redemptions.status_code == 200
+    assert redemptions.json()["total"] == 1
+    record = redemptions.json()["items"][0]
+    assert record["id"] == public_record["id"]
+    assert record["cdks"] == [
+        {
+            "id": cdk["id"],
+            "code": delivered_code,
+            "prefix": cdk["prefix"],
+            "reserved_quantity": 1,
+            "debited_quantity": 1,
+        }
+    ]
+    assert record["created_at"].endswith("+08:00")
+
+    accounts_by_redemption = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"redemption_id": public_record["id"]},
+    )
+    assert accounts_by_redemption.status_code == 200
+    assert [item["id"] for item in accounts_by_redemption.json()["items"]] == [account["id"]]
+
+
+def test_china_time_serialization_and_day_boundaries():
+    source = datetime(2026, 8, 3, 2, 11)
+    assert to_china_iso(source) == "2026-08-03T10:11:00+08:00"
+
+    start, end = china_day_bounds_utc(datetime(2026, 8, 3, 0, 30, tzinfo=timezone.utc))
+    assert start == datetime(2026, 8, 2, 16, 0)
+    assert end == datetime(2026, 8, 3, 16, 0)

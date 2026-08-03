@@ -21,6 +21,7 @@ def settings(tmp_path: Path) -> Settings:
         validation_timeout_seconds=1,
         validation_attempts=1,
         validation_concurrency=2,
+        redelivery_window_seconds=1800,
         public_base_url="http://testserver",
         max_upload_bytes=1024 * 1024,
         max_import_accounts=100,
@@ -40,4 +41,3 @@ def client(settings: Settings):
 @pytest.fixture
 def admin_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-token"}
-

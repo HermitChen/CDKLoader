@@ -7,7 +7,7 @@ CDK Loader 是一个面向账号库存管理和按额度交付的 Web 服务。�
 - **账号导入**：支持 JSON、CSV、TXT 和 ZIP，提供导入预览、重复账号处理和可选的导入后预验活。
 - **凭据验活**：支持远端 OAuth 验证与 Refresh Token 刷新；兑换时会再次实时验证候选账号并自动补位。
 - **CDK 管理**：按数量和账号额度生成 CDK，支持有效期、状态、额度筛选、复制和批量删除。
-- **兑换交付**：支持一次提交多个 CDK、幂等任务、进度查询和一次性下载。
+- **兑换交付**：支持一次提交多个 CDK、幂等任务、进度查询和一次性下载；已兑换 CDK 可在限时窗口内补发其首次关联账号。
 - **双格式 JSON 包**：JSON 交付会生成带时间戳的 ZIP，同时包含 `cpa/` 和 `sub2api/` 两种目录格式，不生成 `manifest.json`。
 - **运营后台**：提供账号池、CDK、兑换记录的服务端筛选、分页、当前页全选和批量操作，账号池可按有无 Refresh Token 筛选，并由管理员勾选账号后导出。
 - **凭据保护**：账号敏感字段使用 AES-GCM 加密后写入数据库，CDK 使用带密钥摘要匹配。
@@ -102,6 +102,7 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 | `VALIDATION_TIMEOUT_SECONDS` | `5` | 单次远端请求超时秒数 |
 | `VALIDATION_ATTEMPTS` | `2` | 单个账号的最大验活尝试次数 |
 | `VALIDATION_CONCURRENCY` | `6` | 兑换时并行验活的最大任务数 |
+| `REDELIVERY_WINDOW_SECONDS` | `1800` | 已兑换 CDK 的公开补发窗口（秒），设为 `0` 可关闭补发 |
 | `PUBLIC_BASE_URL` | `http://localhost:1456` | 用户访问服务的外部地址 |
 
 完整示例及逐项注释见 [.env.example](.env.example)。
@@ -135,7 +136,7 @@ accounts_20260801_153045.zip
     └── user@example.com_sub2api.json
 ```
 
-下载链接只能成功使用一次。已交付文件包含敏感凭据，请在受控环境中保存和传输。
+原始下载链接只能成功使用一次。若 CDK 已成功兑换，在 `REDELIVERY_WINDOW_SECONDS` 指定的窗口内再次提交同一 CDK，系统会直接补发该 CDK 首次关联的账号，不会重新验活、分配账号或扣减额度；每次补发仍使用新的单次下载链接。窗口结束后，公开页面不再支持补发，管理员可在账号池中按关联关系二次导出。已交付文件包含敏感凭据，请在受控环境中保存和传输。
 
 ## 验活行为
 

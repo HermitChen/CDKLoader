@@ -4,6 +4,9 @@ import io
 import json
 import re
 import zipfile
+from datetime import timedelta
+
+from app.models import Redemption, utcnow
 
 
 def _import_accounts(client, admin_headers, count: int = 1):
@@ -119,6 +122,121 @@ def test_multi_cdk_redemption_delivers_zip_once(client, admin_headers):
         params={"token": body["task_token"]},
     )
     assert duplicate_download.status_code == 410
+
+
+def test_redeemed_cdk_redelivers_only_its_accounts_without_validation(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers, count=2)
+    codes = _generate_cdks(client, admin_headers, count=2)
+    initial = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "initial-multi-cdk", "Prefer": "wait=3"},
+        json={"codes": codes},
+    )
+    assert initial.status_code == 200, initial.text
+    source = initial.json()
+    assert source["status"] == "completed"
+
+    cdk = client.get(
+        "/api/v1/admin/cdks",
+        headers=admin_headers,
+        params={"q": codes[0]},
+    ).json()["items"][0]
+    delivered_accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"cdk_id": cdk["id"]},
+    ).json()["items"]
+    other_cdk = client.get(
+        "/api/v1/admin/cdks",
+        headers=admin_headers,
+        params={"q": codes[1]},
+    ).json()["items"][0]
+    other_accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"cdk_id": other_cdk["id"]},
+    ).json()["items"]
+    assert len(delivered_accounts) == len(other_accounts) == 1
+
+    def should_not_validate(_account):
+        raise AssertionError("补发不应触发账号验活")
+
+    monkeypatch.setattr(client.app.state.validator, "validate", should_not_validate)
+    redelivery = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "redelivery-single-cdk", "Prefer": "wait=3"},
+        json={"codes": [codes[0]]},
+    )
+    assert redelivery.status_code == 200, redelivery.text
+    payload = redelivery.json()
+    assert payload["delivery_type"] == "redelivery"
+    assert payload["status"] == "redelivery_ready"
+    assert payload["delivered_count"] == 1
+    assert payload["message"] == "CDK 已兑换，正在补发首次交付的关联账号。"
+
+    download = client.get(
+        f"/api/v1/redeliveries/{payload['id']}/download",
+        params={"token": payload["task_token"]},
+    )
+    assert download.status_code == 200, download.text
+    with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+        names = archive.namelist()
+    expected_email = delivered_accounts[0]["email"]
+    other_email = other_accounts[0]["email"]
+    assert names == [f"cpa/{expected_email}.json", f"sub2api/{expected_email}_sub2api.json"]
+    assert all(other_email not in name for name in names)
+    cdk_after_redelivery = client.get(
+        "/api/v1/admin/cdks",
+        headers=admin_headers,
+        params={"q": codes[0]},
+    ).json()["items"][0]
+    assert cdk_after_redelivery["remaining_quota"] == 0
+    assert cdk_after_redelivery["delivery_count"] == 1
+
+    used_download = client.get(
+        f"/api/v1/redeliveries/{payload['id']}/download",
+        params={"token": payload["task_token"]},
+    )
+    assert used_download.status_code == 410
+
+
+def test_redeemed_cdk_redelivery_window_expiry_and_mixed_submission(client, admin_headers, settings, monkeypatch):
+    _import_accounts(client, admin_headers, count=1)
+    used_code = _generate_cdks(client, admin_headers, count=1)[0]
+    initial = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "initial-expiring-cdk", "Prefer": "wait=3"},
+        json={"codes": [used_code]},
+    )
+    assert initial.status_code == 200, initial.text
+
+    fresh_code = _generate_cdks(client, admin_headers, count=1)[0]
+    mixed = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "mixed-cdk-submission", "Prefer": "wait=3"},
+        json={"codes": [used_code, fresh_code]},
+    )
+    assert mixed.status_code == 400
+    assert mixed.json()["detail"]["code"] == "mixed_cdk_state"
+
+    with client.app.state.session_factory.begin() as session:
+        redemption = session.get(Redemption, initial.json()["id"])
+        assert redemption
+        redemption.completed_at = utcnow() - timedelta(seconds=settings.redelivery_window_seconds + 1)
+
+    def should_not_validate(_account):
+        raise AssertionError("过期补发不应触发账号验活")
+
+    monkeypatch.setattr(client.app.state.validator, "validate", should_not_validate)
+    expired = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "expired-redelivery", "Prefer": "wait=3"},
+        json={"codes": [used_code]},
+    )
+    assert expired.status_code == 400
+    detail = expired.json()["detail"]
+    assert detail["code"] == "cdk_redelivery_expired"
+    assert detail["details"][0]["code"] == "redelivery_expired"
 
 
 def test_single_json_delivery_defaults_to_cpa_and_sub2api_zip(client, admin_headers):

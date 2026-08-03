@@ -49,6 +49,13 @@ class SecurityManager:
         ).digest()
         return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
+    def redelivery_token(self, redelivery_id: str, idempotency_key: str) -> str:
+        raw = f"redelivery:{redelivery_id}:{idempotency_key}"
+        digest = hmac.new(
+            self.cdk_pepper.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256
+        ).digest()
+        return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
     @staticmethod
     def constant_time_equal(left: str, right: str) -> bool:
         return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
@@ -66,4 +73,3 @@ def token_hint(value: str | None) -> str:
     if not value:
         return ""
     return f"***{value[-4:]}" if len(value) > 4 else "***"
-

@@ -35,6 +35,7 @@ class Settings:
     validation_timeout_seconds: float
     validation_attempts: int
     validation_concurrency: int
+    redelivery_window_seconds: int
     public_base_url: str
     max_upload_bytes: int
     max_import_accounts: int
@@ -61,6 +62,7 @@ def get_settings() -> Settings:
         validation_timeout_seconds=float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "5")),
         validation_attempts=max(1, int(os.getenv("VALIDATION_ATTEMPTS", "2"))),
         validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "6"))),
+        redelivery_window_seconds=max(0, int(os.getenv("REDELIVERY_WINDOW_SECONDS", "1800"))),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:1456").rstrip("/"),
         max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024))),
         max_import_accounts=int(os.getenv("MAX_IMPORT_ACCOUNTS", "5000")),
@@ -71,4 +73,3 @@ def get_settings() -> Settings:
         oauth_client_id=os.getenv("OPENAI_OAUTH_CLIENT_ID", "app_2SKx67EdpoN0G6j64rFvigXD"),
         oauth_redirect_uri=os.getenv("OPENAI_OAUTH_REDIRECT_URI", ""),
     )
-
