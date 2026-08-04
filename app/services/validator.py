@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -29,6 +30,31 @@ class ValidationResult:
 class TokenValidator:
     validation_url = "https://auth.openai.com/api/accounts/oauth/userinfo"
     token_url = "https://auth.openai.com/oauth/token"
+    chatgpt_base_url = "https://chatgpt.com"
+    conversation_init_path = "/backend-api/conversation/init"
+    account_check_path = "/backend-api/accounts/check/v4-2023-04-27"
+    access_token_expiry_skew = timedelta(seconds=60)
+
+    _terminal_refresh_error_codes = frozenset(
+        {
+            "invalid_grant",
+            "invalid_refresh_token",
+            "login_required",
+            "reauthentication_required",
+            "refresh_token_expired",
+            "refresh_token_invalidated",
+        }
+    )
+    _terminal_refresh_message_fragments = (
+        "invalid refresh token",
+        "please log in again",
+        "refresh token has expired",
+        "refresh token invalidated",
+        "refresh token is invalid",
+        "refresh token has already been used",
+        "session expired",
+        "session has ended",
+    )
 
     def __init__(self, settings: Settings, security: SecurityManager):
         self.settings = settings
@@ -37,35 +63,61 @@ class TokenValidator:
     def _session(self):
         return cffi_requests.Session(impersonate="chrome120")
 
-    def _validate_access_token(self, access_token: str) -> ValidationResult:
+    @staticmethod
+    def _close_session(session: Any) -> None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _response_json_object(response: Any) -> bool:
+        try:
+            return isinstance(response.json(), dict)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _seed_chatgpt_device_cookie(session: Any, device_id: str) -> None:
+        cookies = getattr(session, "cookies", None)
+        if cookies is None:
+            return
+        for domain in ("chatgpt.com", ".chatgpt.com"):
+            try:
+                cookies.set("oai-did", device_id, domain=domain, path="/")
+            except Exception:
+                continue
+
+    def _validate_oauth_identity(self, access_token: str) -> ValidationResult:
         started = time.perf_counter()
         last_message = "远端验证暂不可用"
         for attempt in range(self.settings.validation_attempts):
+            session = self._session()
             try:
-                response = self._session().get(
+                response = session.get(
                     self.validation_url,
                     headers={"authorization": f"Bearer {access_token}", "accept": "application/json"},
                     timeout=self.settings.validation_timeout_seconds,
                 )
                 elapsed = int((time.perf_counter() - started) * 1000)
                 if response.status_code == 200:
-                    return ValidationResult("valid", latency_ms=elapsed)
-                if response.status_code == 401:
+                    if self._response_json_object(response):
+                        return ValidationResult("valid", latency_ms=elapsed)
+                    last_message = "OAuth 身份响应无效，暂时无法确认"
+                elif response.status_code == 401:
                     return ValidationResult("invalid", "access_token", "Access Token 无效或已过期", latency_ms=elapsed)
-                if response.status_code == 403:
-                    detail = (response.text or "").lower()
-                    if any(word in detail for word in ("banned", "suspended", "deactivated", "disabled")):
-                        return ValidationResult("invalid", "banned", "账号已被封禁或停用", latency_ms=elapsed)
-                    if any(word in detail for word in ("token", "expired", "invalid", "unauthorized")):
-                        return ValidationResult("invalid", "access_token", "Access Token 无效或已过期", latency_ms=elapsed)
-                if response.status_code == 429:
+                elif response.status_code == 429:
                     last_message = "上游限流，暂时无法确认"
+                elif response.status_code == 403:
+                    last_message = "上游风控或访问限制，暂时无法确认"
                 elif response.status_code >= 500:
                     last_message = f"上游服务暂不可用: HTTP {response.status_code}"
                 else:
                     last_message = f"上游验证暂不可用: HTTP {response.status_code}"
             except Exception:
                 last_message = "网络或 TLS 错误，暂时无法确认"
+            finally:
+                self._close_session(session)
             if attempt < self.settings.validation_attempts - 1:
                 time.sleep(0.25 * (attempt + 1))
         return ValidationResult(
@@ -75,8 +127,167 @@ class TokenValidator:
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
 
+    def _chatgpt_headers(
+        self,
+        access_token: str,
+        path: str,
+        *,
+        device_id: str,
+        session_id: str,
+        content_type: str | None = None,
+    ) -> dict[str, str]:
+        headers = {
+            "authorization": f"Bearer {access_token}",
+            "accept": "application/json",
+            "origin": self.chatgpt_base_url,
+            "referer": f"{self.chatgpt_base_url}/",
+            "oai-device-id": device_id,
+            "oai-session-id": session_id,
+            "x-openai-target-path": path,
+            "x-openai-target-route": path,
+        }
+        if content_type:
+            headers["content-type"] = content_type
+        return headers
+
+    def _probe_chatgpt_once(self, access_token: str) -> tuple[str, str]:
+        """Probe both product endpoints so an auth rejection wins over a transient peer failure."""
+        session = self._session()
+        device_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        self._seed_chatgpt_device_cookie(session, device_id)
+        failures: list[str] = []
+        rejected_probe = ""
+        probes = (
+            (
+                "conversation/init",
+                "post",
+                self.conversation_init_path,
+                self.chatgpt_base_url + self.conversation_init_path,
+                {
+                    "gizmo_id": None,
+                    "requested_default_model": None,
+                    "conversation_id": None,
+                    "timezone_offset_min": -480,
+                },
+            ),
+            (
+                "accounts/check",
+                "get",
+                self.account_check_path,
+                self.chatgpt_base_url + self.account_check_path + "?timezone_offset_min=-480",
+                None,
+            ),
+        )
+        try:
+            for name, method, path, url, payload in probes:
+                try:
+                    headers = self._chatgpt_headers(
+                        access_token,
+                        path,
+                        device_id=device_id,
+                        session_id=session_id,
+                        content_type="application/json" if payload is not None else None,
+                    )
+                    if method == "post":
+                        response = session.post(
+                            url,
+                            headers=headers,
+                            json=payload,
+                            timeout=self.settings.validation_timeout_seconds,
+                        )
+                    else:
+                        response = session.get(
+                            url,
+                            headers=headers,
+                            timeout=self.settings.validation_timeout_seconds,
+                        )
+                except Exception:
+                    failures.append(f"{name} 网络或 TLS 错误")
+                    continue
+
+                if response.status_code == 401:
+                    rejected_probe = rejected_probe or name
+                    continue
+                if response.status_code != 200:
+                    if response.status_code == 403:
+                        failures.append(f"{name} 上游风控或访问限制")
+                    elif response.status_code == 429:
+                        failures.append(f"{name} 上游限流")
+                    elif response.status_code >= 500:
+                        failures.append(f"{name} 上游服务暂不可用: HTTP {response.status_code}")
+                    else:
+                        failures.append(f"{name} 验证暂不可用: HTTP {response.status_code}")
+                    continue
+                if not self._response_json_object(response):
+                    failures.append(f"{name} 响应无效")
+            if rejected_probe:
+                return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token"
+            if not failures:
+                return "valid", ""
+            return "inconclusive", "；".join(failures)
+        finally:
+            self._close_session(session)
+
+    def _validate_chatgpt_access(self, access_token: str) -> ValidationResult:
+        started = time.perf_counter()
+        last_message = "ChatGPT 实际能力验证暂不可用"
+        for attempt in range(self.settings.validation_attempts):
+            outcome, message = self._probe_chatgpt_once(access_token)
+            elapsed = int((time.perf_counter() - started) * 1000)
+            if outcome == "valid":
+                return ValidationResult("valid", latency_ms=elapsed)
+            if outcome == "invalid":
+                return ValidationResult("invalid", "access_token", message, latency_ms=elapsed)
+            last_message = message or last_message
+            if attempt < self.settings.validation_attempts - 1:
+                time.sleep(0.25 * (attempt + 1))
+        return ValidationResult(
+            "inconclusive",
+            "transient",
+            last_message,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    def _validate_access_token(self, access_token: str) -> ValidationResult:
+        started = time.perf_counter()
+        identity = self._validate_oauth_identity(access_token)
+        if identity.outcome != "valid":
+            return identity
+        product = self._validate_chatgpt_access(access_token)
+        product.latency_ms = int((time.perf_counter() - started) * 1000)
+        return product
+
+    @classmethod
+    def _is_terminal_refresh_failure(cls, response: Any) -> bool:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error_code = str(error.get("code") or error.get("type") or "").strip().casefold()
+            nested_description = str(
+                error.get("message") or error.get("description") or error.get("detail") or ""
+            ).strip()
+        else:
+            error_code = str(error or "").strip().casefold()
+            nested_description = ""
+        description = str(
+            payload.get("error_description")
+            or payload.get("message")
+            or nested_description
+            or getattr(response, "text", "")
+            or ""
+        ).strip().casefold()
+        return error_code in cls._terminal_refresh_error_codes or any(
+            fragment in description for fragment in cls._terminal_refresh_message_fragments
+        )
+
     def _refresh(self, refresh_token: str, client_id: str | None) -> ValidationResult:
         started = time.perf_counter()
+        session = self._session()
         try:
             payload: dict[str, Any] = {
                 "client_id": client_id or self.settings.oauth_client_id,
@@ -85,7 +296,7 @@ class TokenValidator:
             }
             if self.settings.oauth_redirect_uri:
                 payload["redirect_uri"] = self.settings.oauth_redirect_uri
-            response = self._session().post(
+            response = session.post(
                 self.token_url,
                 headers={"content-type": "application/x-www-form-urlencoded", "accept": "application/json"},
                 data=payload,
@@ -93,14 +304,22 @@ class TokenValidator:
             )
             elapsed = int((time.perf_counter() - started) * 1000)
             if response.status_code != 200:
-                if response.status_code in {400, 401}:
+                if self._is_terminal_refresh_failure(response):
                     return ValidationResult("invalid", "refresh_token", "Refresh Token 无效或已过期", "refresh_token", latency_ms=elapsed)
                 return ValidationResult("inconclusive", "transient", f"刷新服务暂不可用: HTTP {response.status_code}", "refresh_token", latency_ms=elapsed)
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                return ValidationResult("inconclusive", "transient", "刷新响应无效，暂时无法确认", "refresh_token", latency_ms=elapsed)
+            if not isinstance(data, dict):
+                return ValidationResult("inconclusive", "transient", "刷新响应无效，暂时无法确认", "refresh_token", latency_ms=elapsed)
             access_token = str(data.get("access_token") or "")
             if not access_token:
-                return ValidationResult("invalid", "refresh_token", "刷新响应缺少 Access Token", "refresh_token", latency_ms=elapsed)
-            expires_in = int(data.get("expires_in") or 3600)
+                return ValidationResult("inconclusive", "transient", "刷新响应缺少 Access Token，暂时无法确认", "refresh_token", latency_ms=elapsed)
+            try:
+                expires_in = int(data.get("expires_in") or 3600)
+            except (TypeError, ValueError):
+                expires_in = 3600
             return ValidationResult(
                 "valid",
                 validated_via="refresh_token",
@@ -118,6 +337,25 @@ class TokenValidator:
                 "refresh_token",
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
+        finally:
+            self._close_session(session)
+
+    def _access_token_needs_refresh(self, account: Account) -> bool:
+        return bool(account.expires_at and account.expires_at <= utcnow() + self.access_token_expiry_skew)
+
+    def _confirm_refreshed_access(self, refresh_result: ValidationResult) -> ValidationResult:
+        confirmation = self._validate_access_token(refresh_result.access_token)
+        confirmation.validated_via = "refresh_token"
+        confirmation.access_token = refresh_result.access_token
+        confirmation.refresh_token = refresh_result.refresh_token
+        confirmation.id_token = refresh_result.id_token
+        confirmation.expires_at = refresh_result.expires_at
+        if confirmation.outcome == "invalid":
+            # A newly issued token rejected by the product is not proof that its RT is terminal.
+            confirmation.outcome = "inconclusive"
+            confirmation.error_type = "transient"
+            confirmation.message = "刷新后的 Access Token 仍被实际接口拒绝，暂时无法确认"
+        return confirmation
 
     def validate(self, account: Account) -> ValidationResult:
         access_token = self.security.decrypt(account.access_token_encrypted)
@@ -127,11 +365,17 @@ class TokenValidator:
                 return ValidationResult("valid", "", "结构校验通过", "structural")
             return ValidationResult("invalid", "credentials", "缺少可验证凭据", "structural")
 
+        if refresh_token and (not access_token or self._access_token_needs_refresh(account)):
+            refresh_result = self._refresh(refresh_token, account.client_id)
+            if refresh_result.outcome != "valid":
+                return refresh_result
+            return self._confirm_refreshed_access(refresh_result)
+
         if access_token:
             access_result = self._validate_access_token(access_token)
             if access_result.outcome == "valid" or access_result.outcome == "inconclusive":
                 return access_result
-            if access_result.error_type == "banned" or not refresh_token:
+            if not refresh_token:
                 return access_result
         elif not refresh_token:
             return ValidationResult("invalid", "credentials", "缺少可验证凭据")
@@ -139,14 +383,7 @@ class TokenValidator:
         refresh_result = self._refresh(refresh_token, account.client_id)
         if refresh_result.outcome != "valid":
             return refresh_result
-        confirmation = self._validate_access_token(refresh_result.access_token)
-        confirmation.validated_via = "refresh_token"
-        confirmation.refresh_token = refresh_result.refresh_token
-        confirmation.id_token = refresh_result.id_token
-        confirmation.expires_at = refresh_result.expires_at
-        if confirmation.outcome == "valid":
-            confirmation.access_token = refresh_result.access_token
-        return confirmation
+        return self._confirm_refreshed_access(refresh_result)
 
 
 def apply_validation(
@@ -170,7 +407,8 @@ def persist_validation_result(
     preserve_reservation: bool = False,
 ) -> None:
     account.validated_at = utcnow()
-    if result.outcome == "valid":
+    refreshed_credentials = result.validated_via == "refresh_token" and bool(result.access_token)
+    if result.outcome == "valid" or refreshed_credentials:
         if result.access_token:
             account.access_token_encrypted = validator.security.encrypt(result.access_token)
         if result.refresh_token:
@@ -179,9 +417,10 @@ def persist_validation_result(
             account.id_token_encrypted = validator.security.encrypt(result.id_token)
         if result.expires_at:
             account.expires_at = result.expires_at
-        if result.validated_via == "refresh_token":
+        if refreshed_credentials:
             account.last_refresh = utcnow()
             account.version += 1
+    if result.outcome == "valid":
         if not preserve_reservation or account.status != "reserved":
             account.status = "available"
     elif result.outcome == "invalid":
