@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from curl_cffi import requests as cffi_requests
@@ -56,12 +58,18 @@ class TokenValidator:
         "session has ended",
     )
 
+    _shared_gate_statuses = frozenset({403, 429})
+
     def __init__(self, settings: Settings, security: SecurityManager):
         self.settings = settings
         self.security = security
 
     def _session(self):
-        return cffi_requests.Session(impersonate="chrome120")
+        kwargs: dict[str, Any] = {"impersonate": "chrome120"}
+        proxy = str(self.settings.validation_proxy or "").strip()
+        if proxy:
+            kwargs["proxy"] = proxy
+        return cffi_requests.Session(**kwargs)
 
     @staticmethod
     def _close_session(session: Any) -> None:
@@ -88,12 +96,55 @@ class TokenValidator:
             except Exception:
                 continue
 
+    @staticmethod
+    def _response_retry_after(response: Any) -> float | None:
+        headers = getattr(response, "headers", None) or {}
+        try:
+            value = str(headers.get("Retry-After") or "").strip()
+        except Exception:
+            return None
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, retry_at.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code in {403, 408, 425, 429} or status_code >= 500
+
+    def _retry_delay_seconds(self, attempt: int, retry_after: float | None = None) -> float:
+        base = max(0.0, float(self.settings.validation_retry_base_seconds))
+        maximum = max(base, float(self.settings.validation_retry_max_seconds))
+        delay = min(maximum, base * (2 ** max(0, attempt)))
+        if retry_after is not None:
+            delay = max(delay, max(0.0, retry_after))
+        jitter = max(0.0, float(self.settings.validation_retry_jitter_seconds))
+        if delay > 0 and jitter > 0:
+            delay += random.uniform(0.0, jitter)
+        return delay
+
+    def _sleep_before_retry(self, attempt: int, retry_after: float | None = None) -> None:
+        delay = self._retry_delay_seconds(attempt, retry_after)
+        if delay > 0:
+            time.sleep(delay)
+
     def _validate_oauth_identity(self, access_token: str) -> ValidationResult:
         started = time.perf_counter()
         last_message = "远端验证暂不可用"
+        retry_after: float | None = None
         for attempt in range(self.settings.validation_attempts):
             session = self._session()
             try:
+                retry_after = None
                 response = session.get(
                     self.validation_url,
                     headers={"authorization": f"Bearer {access_token}", "accept": "application/json"},
@@ -108,18 +159,23 @@ class TokenValidator:
                     return ValidationResult("invalid", "access_token", "Access Token 无效或已过期", latency_ms=elapsed)
                 elif response.status_code == 429:
                     last_message = "上游限流，暂时无法确认"
+                    retry_after = self._response_retry_after(response)
                 elif response.status_code == 403:
                     last_message = "上游风控或访问限制，暂时无法确认"
-                elif response.status_code >= 500:
+                    retry_after = self._response_retry_after(response)
+                elif self._is_retryable_status(response.status_code):
                     last_message = f"上游服务暂不可用: HTTP {response.status_code}"
+                    retry_after = self._response_retry_after(response)
                 else:
                     last_message = f"上游验证暂不可用: HTTP {response.status_code}"
+                    retry_after = None
             except Exception:
                 last_message = "网络或 TLS 错误，暂时无法确认"
+                retry_after = None
             finally:
                 self._close_session(session)
             if attempt < self.settings.validation_attempts - 1:
-                time.sleep(0.25 * (attempt + 1))
+                self._sleep_before_retry(attempt, retry_after)
         return ValidationResult(
             "inconclusive",
             "transient",
@@ -150,13 +206,22 @@ class TokenValidator:
             headers["content-type"] = content_type
         return headers
 
-    def _probe_chatgpt_once(self, access_token: str) -> tuple[str, str]:
-        """Probe both product endpoints so an auth rejection wins over a transient peer failure."""
-        session = self._session()
-        device_id = str(uuid.uuid4())
-        session_id = str(uuid.uuid4())
+    def _probe_chatgpt_once(
+        self,
+        access_token: str,
+        *,
+        session: Any | None = None,
+        device_id: str | None = None,
+        session_id: str | None = None,
+    ) -> tuple[str, str, float | None]:
+        """Probe product endpoints while avoiding duplicate requests during a shared gate block."""
+        owns_session = session is None
+        session = session or self._session()
+        device_id = device_id or str(uuid.uuid4())
+        session_id = session_id or str(uuid.uuid4())
         self._seed_chatgpt_device_cookie(session, device_id)
         failures: list[str] = []
+        retry_after_hint: float | None = None
         rejected_probe = ""
         probes = (
             (
@@ -210,44 +275,65 @@ class TokenValidator:
                     rejected_probe = rejected_probe or name
                     continue
                 if response.status_code != 200:
+                    retry_after = self._response_retry_after(response)
+                    if retry_after is not None:
+                        retry_after_hint = max(retry_after_hint or 0.0, retry_after)
                     if response.status_code == 403:
-                        failures.append(f"{name} 上游风控或访问限制")
+                        failure = f"{name} 上游风控或访问限制"
                     elif response.status_code == 429:
-                        failures.append(f"{name} 上游限流")
+                        failure = f"{name} 上游限流"
                     elif response.status_code >= 500:
-                        failures.append(f"{name} 上游服务暂不可用: HTTP {response.status_code}")
+                        failure = f"{name} 上游服务暂不可用: HTTP {response.status_code}"
                     else:
-                        failures.append(f"{name} 验证暂不可用: HTTP {response.status_code}")
+                        failure = f"{name} 验证暂不可用: HTTP {response.status_code}"
+                    if response.status_code in self._shared_gate_statuses:
+                        if rejected_probe:
+                            return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token", None
+                        return "inconclusive", failure, retry_after
+                    failures.append(failure)
                     continue
                 if not self._response_json_object(response):
                     failures.append(f"{name} 响应无效")
             if rejected_probe:
-                return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token"
+                return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token", None
             if not failures:
-                return "valid", ""
-            return "inconclusive", "；".join(failures)
+                return "valid", "", None
+            return "inconclusive", "；".join(failures), retry_after_hint
         finally:
-            self._close_session(session)
+            if owns_session:
+                self._close_session(session)
 
     def _validate_chatgpt_access(self, access_token: str) -> ValidationResult:
         started = time.perf_counter()
         last_message = "ChatGPT 实际能力验证暂不可用"
-        for attempt in range(self.settings.validation_attempts):
-            outcome, message = self._probe_chatgpt_once(access_token)
-            elapsed = int((time.perf_counter() - started) * 1000)
-            if outcome == "valid":
-                return ValidationResult("valid", latency_ms=elapsed)
-            if outcome == "invalid":
-                return ValidationResult("invalid", "access_token", message, latency_ms=elapsed)
-            last_message = message or last_message
-            if attempt < self.settings.validation_attempts - 1:
-                time.sleep(0.25 * (attempt + 1))
-        return ValidationResult(
-            "inconclusive",
-            "transient",
-            last_message,
-            latency_ms=int((time.perf_counter() - started) * 1000),
-        )
+        retry_after: float | None = None
+        session = self._session()
+        device_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        try:
+            for attempt in range(self.settings.validation_attempts):
+                outcome, message, retry_after = self._probe_chatgpt_once(
+                    access_token,
+                    session=session,
+                    device_id=device_id,
+                    session_id=session_id,
+                )
+                elapsed = int((time.perf_counter() - started) * 1000)
+                if outcome == "valid":
+                    return ValidationResult("valid", latency_ms=elapsed)
+                if outcome == "invalid":
+                    return ValidationResult("invalid", "access_token", message, latency_ms=elapsed)
+                last_message = message or last_message
+                if attempt < self.settings.validation_attempts - 1:
+                    self._sleep_before_retry(attempt, retry_after)
+            return ValidationResult(
+                "inconclusive",
+                "transient",
+                last_message,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        finally:
+            self._close_session(session)
 
     def _validate_access_token(self, access_token: str) -> ValidationResult:
         started = time.perf_counter()

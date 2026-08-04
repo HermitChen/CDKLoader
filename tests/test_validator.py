@@ -11,10 +11,17 @@ from app.services.validator import TokenValidator, apply_validation
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: Any = None, text: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        payload: Any = None,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = status_code
         self.payload = payload
         self.text = text
+        self.headers = headers or {}
 
     def json(self) -> Any:
         if isinstance(self.payload, Exception):
@@ -55,8 +62,13 @@ class ScriptedSession:
         pass
 
 
-def _response(status_code: int = 200, payload: Any = None, text: str = "") -> FakeResponse:
-    return FakeResponse(status_code, {} if payload is None else payload, text)
+def _response(
+    status_code: int = 200,
+    payload: Any = None,
+    text: str = "",
+    headers: dict[str, str] | None = None,
+) -> FakeResponse:
+    return FakeResponse(status_code, {} if payload is None else payload, text, headers)
 
 
 def _account(
@@ -193,7 +205,6 @@ def test_product_403_is_inconclusive_even_when_response_mentions_unauthorized(se
         [
             ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
             ("POST", _conversation_init(), _response(403, text="unauthorized")),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
         ],
     )
 
@@ -202,6 +213,87 @@ def test_product_403_is_inconclusive_even_when_response_mentions_unauthorized(se
     assert result.outcome == "inconclusive"
     assert result.error_type == "transient"
     assert all(call["url"] != TokenValidator.token_url for call in sessions.calls)
+    sessions.assert_complete()
+
+
+def test_product_gate_retries_with_retry_after_and_skips_second_probe(settings, monkeypatch):
+    security = SecurityManager("validator-secret", "validator-pepper")
+    validator = TokenValidator(
+        replace(
+            settings,
+            validation_mode="remote",
+            validation_attempts=2,
+            validation_retry_base_seconds=1,
+            validation_retry_max_seconds=10,
+            validation_retry_jitter_seconds=0,
+        ),
+        security,
+    )
+    sessions = ScriptedSessions(
+        [
+            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
+            ("POST", _conversation_init(), _response(403, headers={"Retry-After": "2"})),
+            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
+            ("GET", _account_check(), _response(payload={"accounts": {}})),
+        ]
+    )
+    validator._session = sessions
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.services.validator.time.sleep", sleeps.append)
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "valid"
+    assert sleeps == [2]
+    assert [(call["method"], call["url"]) for call in sessions.calls] == [
+        ("GET", _userinfo()),
+        ("POST", _conversation_init()),
+        ("POST", _conversation_init()),
+        ("GET", _account_check()),
+    ]
+    conversation_calls = [
+        call for call in sessions.calls if call["url"] == _conversation_init()
+    ]
+    assert conversation_calls[0]["headers"]["oai-device-id"] == conversation_calls[1]["headers"]["oai-device-id"]
+    assert conversation_calls[0]["headers"]["oai-session-id"] == conversation_calls[1]["headers"]["oai-session-id"]
+    sessions.assert_complete()
+
+
+def test_product_gate_uses_exponential_backoff_without_retry_after(settings, monkeypatch):
+    security = SecurityManager("validator-secret", "validator-pepper")
+    validator = TokenValidator(
+        replace(
+            settings,
+            validation_mode="remote",
+            validation_attempts=3,
+            validation_retry_base_seconds=1,
+            validation_retry_max_seconds=10,
+            validation_retry_jitter_seconds=0,
+        ),
+        security,
+    )
+    sessions = ScriptedSessions(
+        [
+            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
+            ("POST", _conversation_init(), _response(403)),
+            ("POST", _conversation_init(), _response(403)),
+            ("POST", _conversation_init(), _response(403)),
+        ]
+    )
+    validator._session = sessions
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.services.validator.time.sleep", sleeps.append)
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "inconclusive"
+    assert sleeps == [1, 2]
+    assert [call["url"] for call in sessions.calls] == [
+        _userinfo(),
+        _conversation_init(),
+        _conversation_init(),
+        _conversation_init(),
+    ]
     sessions.assert_complete()
 
 

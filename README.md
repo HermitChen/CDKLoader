@@ -100,7 +100,11 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 | `CDK_PEPPER` | 开发占位值 | CDK 和任务凭证摘要密钥，应与凭据密钥不同 |
 | `VALIDATION_MODE` | `remote` | `remote` 为远端验活，`structural` 仅检查凭据结构 |
 | `VALIDATION_TIMEOUT_SECONDS` | `5` | 单次远端请求超时秒数 |
-| `VALIDATION_ATTEMPTS` | `2` | 单个账号的最大验活尝试次数 |
+| `VALIDATION_ATTEMPTS` | `3` | 单个账号的最大验活尝试次数 |
+| `VALIDATION_PROXY` | 空 | 验活统一出口代理，留空时直连 |
+| `VALIDATION_RETRY_BASE_SECONDS` | `1` | 临时错误重试的初始等待时间，单位为秒 |
+| `VALIDATION_RETRY_MAX_SECONDS` | `30` | 本地指数退避的最大时间，单位为秒；上游 `Retry-After` 优先 |
+| `VALIDATION_RETRY_JITTER_SECONDS` | `0.25` | 重试等待随机抖动范围，单位为秒 |
 | `VALIDATION_CONCURRENCY` | `6` | 兑换时并行验活的最大任务数 |
 | `REDELIVERY_WINDOW_SECONDS` | `1800` | 已兑换 CDK 的公开补发窗口（秒），设为 `0` 可关闭补发 |
 | `PUBLIC_BASE_URL` | `http://localhost:1456` | 用户访问服务的外部地址 |

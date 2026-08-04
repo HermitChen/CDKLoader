@@ -88,6 +88,10 @@ class Settings:
     operation_log_retention_days: int = 30
     export_retention_seconds: int = 86400
     export_dir: str = ""
+    validation_proxy: str = ""
+    validation_retry_base_seconds: float = 1.0
+    validation_retry_max_seconds: float = 30.0
+    validation_retry_jitter_seconds: float = 0.25
 
     @property
     def is_sqlite(self) -> bool:
@@ -105,7 +109,7 @@ def get_settings() -> Settings:
         cdk_pepper=os.getenv("CDK_PEPPER", "development-cdk-pepper"),
         validation_mode=os.getenv("VALIDATION_MODE", "remote").strip().lower(),
         validation_timeout_seconds=float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "5")),
-        validation_attempts=max(1, int(os.getenv("VALIDATION_ATTEMPTS", "2"))),
+        validation_attempts=max(1, int(os.getenv("VALIDATION_ATTEMPTS", "3"))),
         validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "6"))),
         redelivery_window_seconds=max(0, int(os.getenv("REDELIVERY_WINDOW_SECONDS", "1800"))),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:1456").rstrip("/"),
@@ -120,4 +124,14 @@ def get_settings() -> Settings:
         operation_log_retention_days=max(1, int(os.getenv("OPERATION_LOG_RETENTION_DAYS", "30"))),
         export_retention_seconds=max(300, int(os.getenv("EXPORT_RETENTION_SECONDS", "86400"))),
         export_dir=os.getenv("EXPORT_DIR", str(PROJECT_ROOT / "data" / "exports")),
+        validation_proxy=os.getenv("VALIDATION_PROXY", "").strip(),
+        validation_retry_base_seconds=max(
+            0.0, float(os.getenv("VALIDATION_RETRY_BASE_SECONDS", "1"))
+        ),
+        validation_retry_max_seconds=max(
+            0.0, float(os.getenv("VALIDATION_RETRY_MAX_SECONDS", "30"))
+        ),
+        validation_retry_jitter_seconds=max(
+            0.0, float(os.getenv("VALIDATION_RETRY_JITTER_SECONDS", "0.25"))
+        ),
     )
