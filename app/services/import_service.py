@@ -8,10 +8,12 @@ from datetime import datetime
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ..models import Account, AccountImport, AccountImportError, utcnow
+from ..config import Settings
+from ..models import Account, AccountImport, AccountImportError, OperationTask, utcnow
 from ..security import SecurityManager, mask_email, token_hint
 from ..time import to_china_iso
 from .importers import ParseError, ParsedAccount, ParsedBatch
+from .operations import add_operation_log, complete_operation_task, start_operation_task
 from .validator import TokenValidator, apply_validation
 
 
@@ -216,22 +218,102 @@ class AccountImportService:
         session.flush()
         return ImportCommitResult(account_import=account_import, account_ids=imported_ids)
 
-    def prevalidate(self, factory: sessionmaker[Session], import_id: str, account_ids: list[str]) -> None:
+    def prevalidate(
+        self,
+        factory: sessionmaker[Session],
+        import_id: str,
+        account_ids: list[str],
+        task_id: str | None = None,
+        settings: Settings | None = None,
+    ) -> None:
         valid_count = 0
         invalid_count = 0
         inconclusive_count = 0
-        for account_id in account_ids:
+        if task_id:
+            if settings is None:
+                raise ValueError("预验活任务缺少运行配置")
             with factory.begin() as session:
-                account = session.get(Account, account_id)
-                if not account or account.status in {"delivered", "reserved"}:
+                task = session.get(OperationTask, task_id)
+                if not task or task.status not in {"queued", "running"}:
+                    return
+                start_operation_task(task)
+                add_operation_log(
+                    session,
+                    operation_type="account_import_validation",
+                    outcome="started",
+                    task_id=task_id,
+                    resource_id=import_id,
+                    message="导入后的预验活任务开始执行",
+                    details={"total": task.total},
+                )
+        for account_id in account_ids:
+            try:
+                with factory.begin() as session:
+                    account = session.get(Account, account_id)
+                    task = session.get(OperationTask, task_id) if task_id else None
+                    if task_id and (not task or task.status != "running"):
+                        return
+                    if not account or account.status in {"delivered", "reserved"}:
+                        if task:
+                            task.processed += 1
+                            task.skipped_count += 1
+                            add_operation_log(
+                                session,
+                                operation_type="account_import_validation",
+                                outcome="skipped",
+                                task_id=task_id,
+                                resource_id=import_id,
+                                account_id=account_id,
+                                message="账号在预验活前已不可用",
+                            )
+                        continue
+                    result = apply_validation(session, account, self.validator)
+                    if result.outcome == "valid":
+                        valid_count += 1
+                    elif result.outcome == "invalid":
+                        invalid_count += 1
+                    else:
+                        inconclusive_count += 1
+                    if task:
+                        task.processed += 1
+                        if result.outcome == "valid":
+                            task.valid_count += 1
+                        elif result.outcome == "invalid":
+                            task.invalid_count += 1
+                        else:
+                            task.inconclusive_count += 1
+                        add_operation_log(
+                            session,
+                            operation_type="account_import_validation",
+                            outcome=result.outcome,
+                            task_id=task_id,
+                            resource_id=import_id,
+                            account_id=account.id,
+                            message=result.message or f"验活结果：{result.outcome}",
+                            details={
+                                "error_type": result.error_type,
+                                "validated_via": result.validated_via,
+                                "latency_ms": result.latency_ms,
+                            },
+                        )
+            except Exception:
+                if not task_id:
                     continue
-                result = apply_validation(session, account, self.validator)
-                if result.outcome == "valid":
-                    valid_count += 1
-                elif result.outcome == "invalid":
-                    invalid_count += 1
-                else:
-                    inconclusive_count += 1
+                with factory.begin() as session:
+                    task = session.get(OperationTask, task_id)
+                    if not task or task.status != "running":
+                        return
+                    task.processed += 1
+                    task.failed_count += 1
+                    add_operation_log(
+                        session,
+                        operation_type="account_import_validation",
+                        outcome="failed",
+                        task_id=task_id,
+                        resource_id=import_id,
+                        account_id=account_id,
+                        message="预验活执行异常",
+                    )
 
         with factory.begin() as session:
             account_import = session.get(AccountImport, import_id)
@@ -241,6 +323,39 @@ class AccountImportService:
                 account_import.inconclusive_count += inconclusive_count
                 account_import.status = "completed"
                 account_import.completed_at = utcnow()
+                if task_id:
+                    add_operation_log(
+                        session,
+                        operation_type="account_import",
+                        outcome="completed",
+                        resource_id=import_id,
+                        message="账号导入及预验活已完成",
+                        details={
+                            "valid_count": valid_count,
+                            "invalid_count": invalid_count,
+                            "inconclusive_count": inconclusive_count,
+                        },
+                    )
+            if task_id:
+                task = session.get(OperationTask, task_id)
+                if task and task.status == "running":
+                    task.processed = max(task.processed, task.total)
+                    complete_operation_task(task, settings)
+                    add_operation_log(
+                        session,
+                        operation_type="account_import_validation",
+                        outcome="completed",
+                        task_id=task_id,
+                        resource_id=import_id,
+                        message="导入后的预验活任务已完成",
+                        details={
+                            "valid_count": task.valid_count,
+                            "invalid_count": task.invalid_count,
+                            "inconclusive_count": task.inconclusive_count,
+                            "skipped_count": task.skipped_count,
+                            "failed_count": task.failed_count,
+                        },
+                    )
 
 
 def serialize_import(account_import: AccountImport, errors: list[AccountImportError] | None = None) -> dict:

@@ -6,7 +6,7 @@ import re
 import zipfile
 from datetime import timedelta
 
-from app.models import Redemption, utcnow
+from app.models import Redelivery, Redemption, utcnow
 
 
 def _import_accounts(client, admin_headers, count: int = 1):
@@ -72,6 +72,69 @@ def test_import_preview_encrypts_credentials_and_preserves_duplicate_policy(clie
     accounts = client.get("/api/v1/admin/accounts", headers=admin_headers).json()
     assert accounts["total"] == 1
     assert accounts["items"][0]["status"] == "pending_validation"
+
+
+def test_import_accepts_multiple_json_files(client, admin_headers):
+    files = [
+        (
+            "file",
+            (
+                "accounts-one.json",
+                json.dumps(
+                    [{"email": "one@example.com", "account_id": "account-one", "refresh_token": "refresh-one"}]
+                ).encode(),
+                "application/json",
+            ),
+        ),
+        (
+            "file",
+            (
+                "accounts-two.json",
+                json.dumps(
+                    [{"email": "two@example.com", "account_id": "account-two", "refresh_token": "refresh-two"}]
+                ).encode(),
+                "application/json",
+            ),
+        ),
+    ]
+
+    preview = client.post("/api/v1/admin/account-imports/preview", headers=admin_headers, files=files)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["detected_format"] == "json"
+    assert preview.json()["parsed_count"] == 2
+
+    result = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "false"},
+        files=files,
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["inserted_count"] == 2
+
+
+def test_import_preview_accepts_json_larger_than_ten_megabytes(client, admin_headers):
+    source = json.dumps(
+        [
+            {
+                "email": "large@example.com",
+                "account_id": "large-account",
+                "refresh_token": "refresh-large",
+                "metadata": "x" * (11 * 1024 * 1024),
+            }
+        ],
+        separators=(",", ":"),
+    ).encode()
+
+    response = client.post(
+        "/api/v1/admin/account-imports/preview",
+        headers=admin_headers,
+        files={"file": ("large.json", source, "application/json")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detected_format"] == "json"
+    assert response.json()["parsed_count"] == 1
 
 
 def test_multi_cdk_redemption_delivers_zip_once(client, admin_headers):
@@ -237,6 +300,62 @@ def test_redeemed_cdk_redelivery_window_expiry_and_mixed_submission(client, admi
     detail = expired.json()["detail"]
     assert detail["code"] == "cdk_redelivery_expired"
     assert detail["details"][0]["code"] == "redelivery_expired"
+
+
+def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_headers, settings):
+    _import_accounts(client, admin_headers, count=1)
+    code = _generate_cdks(client, admin_headers, count=1)[0]
+    initial = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "initial-export-redelivery", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert initial.status_code == 200, initial.text
+
+    redelivery = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "export-redelivery-request", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert redelivery.status_code == 200, redelivery.text
+    redelivery_body = redelivery.json()
+    export_path = f"/api/v1/redeliveries/{redelivery_body['id']}/export"
+    started = client.post(export_path, params={"token": redelivery_body["task_token"]})
+    assert started.status_code in {200, 202}
+    task = started.json()
+
+    with client.websocket_connect(
+        f"{export_path}/{task['id']}/ws?token={redelivery_body['task_token']}"
+    ) as websocket:
+        for _ in range(50):
+            current = websocket.receive_json()
+            if current["status"] in {"completed", "failed"}:
+                break
+    assert current["status"] == "completed"
+
+    reused = client.post(export_path, params={"token": redelivery_body["task_token"]})
+    assert reused.status_code == 200
+    assert reused.json()["id"] == task["id"]
+    assert reused.json()["file_name"] == current["file_name"]
+
+    downloaded = client.get(
+        f"{export_path}/{task['id']}/download",
+        params={"token": redelivery_body["task_token"]},
+    )
+    assert downloaded.status_code == 200
+
+    with client.app.state.session_factory.begin() as session:
+        redelivery_row = session.get(Redelivery, redelivery_body["id"])
+        assert redelivery_row
+        redelivery_row.recovery_expires_at = utcnow() - timedelta(seconds=1)
+
+    expired_download = client.get(
+        f"{export_path}/{task['id']}/download",
+        params={"token": redelivery_body["task_token"]},
+    )
+    assert expired_download.status_code == 410
+    expired_reuse = client.post(export_path, params={"token": redelivery_body["task_token"]})
+    assert expired_reuse.status_code == 410
 
 
 def test_single_json_delivery_defaults_to_cpa_and_sub2api_zip(client, admin_headers):

@@ -24,6 +24,18 @@ export async function request(path, options = {}) {
   return payload
 }
 
+export async function requestWithMeta(path, options = {}) {
+  const response = await fetch(`${API_ROOT}${path}`, options)
+  const contentType = response.headers.get('content-type') || ''
+  const payload = contentType.includes('application/json') ? await response.json() : await response.text()
+  if (!response.ok) {
+    const detail = payload?.detail ?? payload
+    const message = typeof detail === 'string' ? detail : detail?.message || '请求失败'
+    throw new ApiError(message, detail)
+  }
+  return { payload, response }
+}
+
 export function saveDownload(blob, filename) {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
@@ -44,4 +56,14 @@ export async function download(path, options = {}) {
   const disposition = response.headers.get('content-disposition') || ''
   const match = disposition.match(/filename="?([^";]+)"?/i)
   saveDownload(await response.blob(), match?.[1] || 'accounts.json')
+}
+
+export function triggerDownload(path) {
+  const link = document.createElement('a')
+  link.href = path.startsWith('/api/') ? path : `${API_ROOT}${path}`
+  link.download = ''
+  link.rel = 'noopener'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }

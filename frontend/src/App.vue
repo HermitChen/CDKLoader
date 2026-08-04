@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   Archive,
   ChevronLeft,
@@ -19,6 +19,8 @@ import {
   PackageOpen,
   RefreshCw,
   Search,
+  ScrollText,
+  ShieldCheck,
   Trash2,
   Upload,
   Users,
@@ -41,7 +43,7 @@ import {
   Toast,
   ToolbarShell,
 } from 'nanocat-ui'
-import { adminHeaders, ApiError, download, request } from './api'
+import { adminHeaders, ApiError, download, request, requestWithMeta, triggerDownload } from './api'
 
 const isAdmin = ref(window.location.pathname.startsWith('/admin'))
 const currentYear = new Date().getFullYear()
@@ -51,6 +53,19 @@ const loginError = ref('')
 const activeView = ref('overview')
 const loading = ref(false)
 const accountExportBusy = ref(false)
+const accountValidationBusy = ref(false)
+const accountValidationTask = ref(null)
+const operationTasks = ref([])
+const operationTaskTotal = ref(0)
+const operationLogs = ref([])
+const operationLogTotal = ref(0)
+const operationTaskPage = ref(1)
+const operationLogPage = ref(1)
+const operationTaskPageSize = ref(15)
+const operationLogPageSize = ref(30)
+const operationTaskFilters = ref({ task_type: '', status: '' })
+const operationLogFilters = ref({ q: '', operation_type: '', outcome: '' })
+let adminTaskPollTimer = null
 const pageSizeOptions = [
   { label: '15 / 页', value: 15 }, { label: '30 / 页', value: 30 },
   { label: '50 / 页', value: 50 }, { label: '100 / 页', value: 100 },
@@ -85,7 +100,7 @@ const reissueDialog = ref({ open: false, id: '', prefix: '' })
 const accountImportOpen = ref(false)
 const cdkGeneratorOpen = ref(false)
 
-const importFile = ref(null)
+const importFiles = ref([])
 const importInput = ref(null)
 const importPreview = ref(null)
 const importBusy = ref(false)
@@ -102,12 +117,15 @@ const redeemBusy = ref(false)
 const redeemError = ref('')
 const redeemState = ref(null)
 const redeemStage = ref('')
+const exportTask = ref(null)
+let exportSocket = null
 
 const navItems = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
   { id: 'accounts', label: '账号池', icon: Users },
   { id: 'cdks', label: 'CDK', icon: KeyRound },
   { id: 'redemptions', label: '兑换记录', icon: Archive },
+  { id: 'logs', label: '任务日志', icon: ScrollText },
 ]
 
 const accountStatusOptions = [
@@ -137,9 +155,11 @@ const pageMeta = {
   accounts: { title: '账号池', description: '筛选账号库存，核对关联 CDK 并支持二次导出。' },
   cdks: { title: 'CDK', description: '管理提取码、额度、有效期和已兑换账号。' },
   redemptions: { title: '兑换记录', description: '查看完整 CDK、交付状态和关联账号。' },
+  logs: { title: '任务日志', description: '查看验活、导出和导入任务的进度与结果。' },
 }
 
 const publicCodes = computed(() => codeInput.value.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean))
+const importTotalSize = computed(() => importFiles.value.reduce((total, file) => total + file.size, 0))
 const activePageMeta = computed(() => pageMeta[activeView.value])
 const publicStatus = computed(() => redeemState.value?.status || '')
 const publicStatusText = computed(() => ({
@@ -163,9 +183,9 @@ const allRedemptionResultsSelected = computed(() => redemptionTotal.value > 0 &&
 const maxBulkSelection = 5000
 
 function statusTone(value) {
-  if (['available', 'completed', 'unused', 'validating', 'redelivery_ready', 'redelivery_completed'].includes(value)) return 'success'
-  if (['reserved', 'partial', 'processing', 'queued', 'pending_validation'].includes(value)) return 'warning'
-  if (['expired', 'banned', 'failed', 'exhausted', 'disabled'].includes(value)) return 'error'
+  if (['available', 'completed', 'unused', 'validating', 'redelivery_ready', 'redelivery_completed', 'valid'].includes(value)) return 'success'
+  if (['reserved', 'partial', 'processing', 'running', 'queued', 'pending_validation', 'started', 'inconclusive', 'skipped'].includes(value)) return 'warning'
+  if (['expired', 'banned', 'failed', 'exhausted', 'disabled', 'invalid'].includes(value)) return 'error'
   return 'neutral'
 }
 
@@ -173,8 +193,28 @@ function statusLabel(value) {
   return {
     available: '可用', reserved: '已预约', delivered: '已交付', pending_validation: '待验活',
     quarantined: '已隔离', expired: '已失效', banned: '已封禁', completed: '已完成',
-    processing: '处理中', queued: '排队中', failed: '失败', unused: '未使用', partial: '部分使用',
+    processing: '处理中', running: '处理中', queued: '排队中', failed: '失败', unused: '未使用', partial: '部分使用',
     exhausted: '已耗尽', disabled: '已禁用', validating: '验活中',
+  }[value] || value
+}
+
+function taskTypeLabel(value) {
+  return {
+    manual_validation: '手动验活',
+    account_import_validation: '导入预验活',
+    redemption_export: '兑换导出',
+    redelivery_export: '补发导出',
+    account_import: '账号导入',
+    account_export: '账号导出',
+    redemption: '兑换',
+  }[value] || value
+}
+
+function outcomeLabel(value) {
+  return {
+    queued: '已排队', started: '执行中', completed: '已完成', failed: '失败',
+    valid: '有效', invalid: '无效', inconclusive: '待确认', skipped: '已跳过',
+    processing: '处理中', redelivery_ready: '补发就绪',
   }[value] || value
 }
 
@@ -211,6 +251,10 @@ async function adminRequest(path, options = {}) {
   return request(path, { ...options, headers: { ...adminHeaders(), ...(options.headers || {}) } })
 }
 
+async function adminRequestWithMeta(path, options = {}) {
+  return requestWithMeta(path, { ...options, headers: { ...adminHeaders(), ...(options.headers || {}) } })
+}
+
 async function login() {
   loading.value = true
   loginError.value = ''
@@ -245,6 +289,8 @@ async function loadAdminData() {
       loadAccounts(),
       loadCdks(),
       loadRedemptions(),
+      loadOperationTasks(),
+      loadOperationLogs(),
     ])
     dashboard.value = dashboardResult
   } catch (error) {
@@ -281,6 +327,27 @@ function listQuery(filters, page, requestedPageSize) {
   return queryString(params)
 }
 
+function operationTaskQuery() {
+  const params = new URLSearchParams()
+  if (operationTaskFilters.value.task_type) params.set('task_type', operationTaskFilters.value.task_type)
+  if (operationTaskFilters.value.status) params.set('status', operationTaskFilters.value.status)
+  const size = normalizedPageSize(operationTaskPageSize.value)
+  params.set('limit', String(size))
+  params.set('offset', String(size ? (operationTaskPage.value - 1) * size : 0))
+  return queryString(params)
+}
+
+function operationLogQuery() {
+  const params = new URLSearchParams()
+  if (operationLogFilters.value.q.trim()) params.set('q', operationLogFilters.value.q.trim())
+  if (operationLogFilters.value.operation_type) params.set('operation_type', operationLogFilters.value.operation_type)
+  if (operationLogFilters.value.outcome) params.set('outcome', operationLogFilters.value.outcome)
+  const size = normalizedPageSize(operationLogPageSize.value)
+  params.set('limit', String(size))
+  params.set('offset', String(size ? (operationLogPage.value - 1) * size : 0))
+  return queryString(params)
+}
+
 function pageCount(total, requestedPageSize) {
   const size = normalizedPageSize(requestedPageSize)
   return size ? Math.max(1, Math.ceil(total / size)) : 1
@@ -299,8 +366,71 @@ function searchAccounts() {
   loadAccounts({ clearSelection: true })
 }
 
+function stopAdminTaskPolling() {
+  if (adminTaskPollTimer) {
+    window.clearInterval(adminTaskPollTimer)
+    adminTaskPollTimer = null
+  }
+}
+
+async function refreshAdminTask(taskId) {
+  try {
+    const task = await adminRequest(`/admin/operation-tasks/${taskId}`)
+    accountValidationTask.value = task
+    if (task.status === 'completed' || task.status === 'failed') {
+      stopAdminTaskPolling()
+      accountMessage.value = task.status === 'completed'
+        ? `验活完成：${task.processed}/${task.total}，有效 ${task.valid_count}，无效 ${task.invalid_count}，待确认 ${task.inconclusive_count}。`
+        : `验活任务失败：${task.error_message || '请查看任务日志。'}`
+      await Promise.all([loadAccounts(), loadOperationTasks(), loadOperationLogs()])
+    } else {
+      accountMessage.value = `验活进行中：${task.processed}/${task.total}（${task.percent}%）`
+    }
+  } catch (error) {
+    stopAdminTaskPolling()
+    pushToast('error', '读取验活进度失败', error.message)
+  }
+}
+
+function trackAdminTask(taskId) {
+  stopAdminTaskPolling()
+  if (!taskId) return
+  refreshAdminTask(taskId)
+  adminTaskPollTimer = window.setInterval(() => refreshAdminTask(taskId), 900)
+}
+
 async function exportSelectedAccounts() {
   await exportAccounts(selectedAccountIds.value, '导出完成')
+}
+
+async function validateSelectedAccounts() {
+  const ids = [...selectedAccountIds.value]
+  if (!ids.length || accountValidationBusy.value) return
+  accountValidationBusy.value = true
+  accountMessage.value = ''
+  try {
+    const { payload: result, response } = await adminRequestWithMeta('/admin/accounts/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    })
+    const taskId = response.headers.get('x-operation-task-id')
+    accountValidationTask.value = taskId ? { id: taskId, status: 'queued', processed: 0, total: ids.length, percent: 0 } : null
+    selectedAccountIds.value = []
+    const accepted = result.accepted || 0
+    const skipped = result.skipped?.length || 0
+    accountMessage.value = accepted
+      ? `已提交 ${accepted} 个账号验活${skipped ? `，跳过 ${skipped} 个不可验活账号` : ''}。`
+      : `没有可验活的账号${skipped ? `，跳过 ${skipped} 个不可验活账号` : ''}。`
+    pushToast(accepted ? 'success' : 'warning', '批量验活', accountMessage.value)
+    await Promise.all([loadAccounts(), loadOperationTasks(), loadOperationLogs()])
+    if (taskId) trackAdminTask(taskId)
+  } catch (error) {
+    accountMessage.value = error.message
+    pushToast('error', '批量验活失败', error.message)
+  } finally {
+    accountValidationBusy.value = false
+  }
 }
 
 async function reexportAccount(account) {
@@ -374,6 +504,26 @@ async function loadRedemptions({ clearSelection = false } = {}) {
   if (clearSelection) selectedRedemptionIds.value = []
 }
 
+async function loadOperationTasks() {
+  const result = await adminRequest(`/admin/operation-tasks${operationTaskQuery()}`)
+  operationTasks.value = result.items
+  operationTaskTotal.value = result.total
+  if (operationTaskPage.value > pageCount(operationTaskTotal.value, operationTaskPageSize.value)) {
+    operationTaskPage.value = pageCount(operationTaskTotal.value, operationTaskPageSize.value)
+    return loadOperationTasks()
+  }
+}
+
+async function loadOperationLogs() {
+  const result = await adminRequest(`/admin/operation-logs${operationLogQuery()}`)
+  operationLogs.value = result.items
+  operationLogTotal.value = result.total
+  if (operationLogPage.value > pageCount(operationLogTotal.value, operationLogPageSize.value)) {
+    operationLogPage.value = pageCount(operationLogTotal.value, operationLogPageSize.value)
+    return loadOperationLogs()
+  }
+}
+
 function changeAccountPage(delta) {
   const nextPage = Math.min(pageCount(accountTotal.value, accountPageSize.value), Math.max(1, accountPage.value + delta))
   if (nextPage === accountPage.value) return
@@ -408,6 +558,40 @@ function changeCdkPageSize() {
 function changeRedemptionPageSize() {
   redemptionPage.value = 1
   loadRedemptions()
+}
+
+function changeOperationTaskPage(delta) {
+  const nextPage = Math.min(pageCount(operationTaskTotal.value, operationTaskPageSize.value), Math.max(1, operationTaskPage.value + delta))
+  if (nextPage === operationTaskPage.value) return
+  operationTaskPage.value = nextPage
+  loadOperationTasks()
+}
+
+function changeOperationLogPage(delta) {
+  const nextPage = Math.min(pageCount(operationLogTotal.value, operationLogPageSize.value), Math.max(1, operationLogPage.value + delta))
+  if (nextPage === operationLogPage.value) return
+  operationLogPage.value = nextPage
+  loadOperationLogs()
+}
+
+function searchOperationLogs() {
+  operationLogPage.value = 1
+  loadOperationLogs()
+}
+
+function filterOperationTasks() {
+  operationTaskPage.value = 1
+  loadOperationTasks()
+}
+
+function changeOperationTaskPageSize() {
+  operationTaskPage.value = 1
+  loadOperationTasks()
+}
+
+function changeOperationLogPageSize() {
+  operationLogPage.value = 1
+  loadOperationLogs()
 }
 
 function openTodayRedemptions() {
@@ -690,32 +874,47 @@ async function deleteSelectedRedemptions() {
 }
 
 function chooseImportFile() {
+  if (importInput.value) importInput.value.value = ''
   importInput.value?.click()
 }
 
-function setImportFile(file) {
-  if (!file) return
-  importFile.value = file
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function setImportFiles(files) {
+  const nextFiles = Array.from(files || []).filter(Boolean)
+  if (!nextFiles.length) return
+  importFiles.value = nextFiles
   importPreview.value = null
   importMessage.value = ''
 }
 
+function removeImportFile(index) {
+  importFiles.value = importFiles.value.filter((_, fileIndex) => fileIndex !== index)
+  importPreview.value = null
+  importMessage.value = ''
+  if (!importFiles.value.length && importInput.value) importInput.value.value = ''
+}
+
 function onImportFileChange(event) {
-  setImportFile(event.target.files?.[0])
+  setImportFiles(event.target.files)
 }
 
 function onDrop(event) {
   event.preventDefault()
-  setImportFile(event.dataTransfer.files?.[0])
+  setImportFiles(event.dataTransfer.files)
 }
 
 async function previewImport() {
-  if (!importFile.value) return
+  if (!importFiles.value.length) return
   importBusy.value = true
   importMessage.value = ''
   try {
     const form = new FormData()
-    form.append('file', importFile.value)
+    importFiles.value.forEach((file) => form.append('file', file, file.name))
     importPreview.value = await adminRequest('/admin/account-imports/preview', { method: 'POST', body: form })
   } catch (error) {
     importMessage.value = error.message
@@ -726,22 +925,23 @@ async function previewImport() {
 }
 
 async function commitImport() {
-  if (!importFile.value) return
+  if (!importFiles.value.length) return
   importBusy.value = true
   importMessage.value = ''
   try {
     const form = new FormData()
-    form.append('file', importFile.value)
+    importFiles.value.forEach((file) => form.append('file', file, file.name))
     form.append('duplicate_strategy', importOptions.value.duplicate_strategy)
     form.append('prevalidate', String(importOptions.value.prevalidate))
     const result = await adminRequest('/admin/account-imports', { method: 'POST', body: form })
     importMessage.value = result.status === 'validating' ? '导入已提交，正在预验活。' : '导入已完成。'
     pushToast('success', '账号导入', importMessage.value)
-    importFile.value = null
+    importFiles.value = []
     importPreview.value = null
     accountImportOpen.value = false
     if (importInput.value) importInput.value.value = ''
     await loadAdminData()
+    if (result.validation_task_id) trackAdminTask(result.validation_task_id)
   } catch (error) {
     importMessage.value = error.message
     pushToast('error', '导入失败', error.message)
@@ -787,13 +987,11 @@ function newIdempotencyKey() {
 }
 
 async function pollRedemption(id, token) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 700))
     const result = await request(`/redemptions/${id}?token=${encodeURIComponent(token)}`)
     redeemState.value = result
     if (result.status === 'completed') {
-      redeemStage.value = '正在准备下载'
-      await download(`/redemptions/${id}/download?token=${encodeURIComponent(token)}`)
       return
     }
     if (result.status === 'failed') throw new ApiError(result.error_message || '兑换失败')
@@ -801,11 +999,89 @@ async function pollRedemption(id, token) {
   throw new ApiError('任务等待超时，请稍后使用原任务凭证查询。')
 }
 
+function closeExportStream() {
+  if (exportSocket) {
+    exportSocket.close()
+    exportSocket = null
+  }
+}
+
+async function pollExportTask(path, task, token) {
+  for (let attempt = 0; attempt < 1800; attempt += 1) {
+    const result = await request(`${path}/${task.id}?token=${encodeURIComponent(token)}`)
+    exportTask.value = result
+    if (result.status === 'completed') return result
+    if (result.status === 'failed') throw new ApiError(result.error_message || '导出失败')
+    await new Promise((resolve) => window.setTimeout(resolve, 800))
+  }
+  throw new ApiError('导出任务等待超时，请稍后重试。')
+}
+
+async function waitForExportTask(path, task, token) {
+  if (task.status === 'completed') return task
+  if (task.status === 'failed') throw new ApiError(task.error_message || '导出失败')
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let fallbackStarted = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      closeExportStream()
+      callback(value)
+    }
+    const fallback = async () => {
+      if (settled || fallbackStarted) return
+      fallbackStarted = true
+      try {
+        const result = await pollExportTask(path, task, token)
+        settle(resolve, result)
+      } catch (error) {
+        settle(reject, error)
+      }
+    }
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const socketPath = `${protocol}//${window.location.host}/api/v1${path}/${task.id}/ws?token=${encodeURIComponent(token)}`
+      exportSocket = new WebSocket(socketPath)
+      exportSocket.onmessage = (event) => {
+        try {
+          const result = JSON.parse(event.data)
+          exportTask.value = result
+          if (result.status === 'completed') settle(resolve, result)
+          if (result.status === 'failed') settle(reject, new ApiError(result.error_message || '导出失败'))
+        } catch (error) {
+          settle(reject, error)
+        }
+      }
+      exportSocket.onerror = fallback
+      exportSocket.onclose = () => {
+        if (!settled) fallback()
+      }
+    } catch {
+      fallback()
+    }
+  })
+}
+
+async function startExportTask(path, token) {
+  redeemStage.value = '正在创建导出任务'
+  const task = await request(`${path}?token=${encodeURIComponent(token)}`, { method: 'POST' })
+  exportTask.value = task
+  redeemStage.value = task.status === 'completed' ? '正在开始下载' : '正在打包导出文件'
+  const completed = await waitForExportTask(path, task, token)
+  exportTask.value = completed
+  redeemStage.value = '下载已开始'
+  triggerDownload(completed.download_url)
+  return completed
+}
+
 async function redeem() {
   if (!publicCodes.value.length || redeemBusy.value) return
   redeemBusy.value = true
   redeemError.value = ''
   redeemState.value = null
+  exportTask.value = null
+  closeExportStream()
   redeemStage.value = '正在校验 CDK'
   const idempotencyKey = newIdempotencyKey()
   try {
@@ -820,14 +1096,13 @@ async function redeem() {
     })
     redeemState.value = result
     if (result.delivery_type === 'redelivery') {
-      redeemStage.value = result.message || 'CDK 已兑换，正在补发关联账号'
-      await download(`/redeliveries/${result.id}/download?token=${encodeURIComponent(result.task_token)}`)
+      redeemStage.value = result.message || 'CDK 已兑换，正在准备补发导出'
+      await startExportTask(`/redeliveries/${result.id}/export`, result.task_token)
       redeemState.value = { ...result, status: 'redelivery_completed' }
       return
     }
     if (result.status === 'completed') {
-      redeemStage.value = '正在准备下载'
-      await download(`/redemptions/${result.id}/download?token=${encodeURIComponent(result.task_token)}`)
+      await startExportTask(`/redemptions/${result.id}/export`, result.task_token)
     } else if (result.status === 'failed') {
       throw new ApiError(result.error_message || '兑换失败')
     } else {
@@ -849,6 +1124,11 @@ function goPublic() {
 onMounted(async () => {
   if (isAdmin.value && adminToken.value) await loadAdminData()
 })
+
+onUnmounted(() => {
+  stopAdminTaskPolling()
+  closeExportStream()
+})
 </script>
 
 <template>
@@ -866,6 +1146,10 @@ onMounted(async () => {
         <div class="redeem-meta"><span>{{ publicCodes.length ? `已识别 ${publicCodes.length} 个 CDK` : '等待输入' }}</span><span v-if="redeemBusy" class="processing"><LoaderCircle :size="15" class="spin" />{{ redeemStage || publicStatusText }}</span></div>
         <CalloutBox v-if="redeemError" tone="error" variant="soft" size="sm">{{ redeemError }}</CalloutBox>
         <div v-if="redeemState && !redeemError" class="redeem-result"><StatusPill :label="publicStatusText" :tone="statusTone(publicStatus)" size="xs" radius="rounded" /><span v-if="redeemState.delivered_count">{{ redeemState.delivered_count }} 个账号</span></div>
+        <div v-if="exportTask && !redeemError" class="export-progress" aria-live="polite">
+          <div class="export-progress-meta"><span>{{ exportTask.status === 'completed' ? '导出文件已就绪' : '正在打包导出文件' }}</span><strong>{{ exportTask.processed }} / {{ exportTask.total }}</strong></div>
+          <div class="progress-track" role="progressbar" :aria-valuenow="exportTask.percent" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: `${exportTask.percent}%` }" /></div>
+        </div>
         <NButton class="redeem-action" type="button" variant="primary" size="md" block :disabled="!publicCodes.length || redeemBusy" @click="redeem"><CloudDownload v-if="!redeemBusy" :size="17" /><LoaderCircle v-else :size="17" class="spin" />{{ redeemBusy ? '处理中' : '下载 JSON 包' }}</NButton>
       </FormSection>
     </main>
@@ -910,7 +1194,7 @@ onMounted(async () => {
           <h1>{{ activePageMeta.title }}</h1>
           <p class="page-description">{{ activePageMeta.description }}</p>
         </div>
-        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
+        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || accountValidationBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
       </header>
 
       <section v-if="activeView === 'overview'" class="overview-view">
@@ -927,7 +1211,7 @@ onMounted(async () => {
 
       <section v-if="activeView === 'accounts'" class="workspace-section">
         <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><NButton v-if="accountTotal > accounts.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy)" @click="toggleAllResults('accounts')"><LoaderCircle v-if="selectionBusy === 'accounts'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allAccountResultsSelected ? '取消全部选择' : `选择全部 ${accountTotal} 项` }}</NButton><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><NButton v-if="accountTotal > accounts.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy) || accountValidationBusy || accountExportBusy" @click="toggleAllResults('accounts')"><LoaderCircle v-if="selectionBusy === 'accounts'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allAccountResultsSelected ? '取消全部选择' : `选择全部 ${accountTotal} 项` }}</NButton><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="outline" size="xs" :disabled="accountValidationBusy || accountExportBusy" @click="validateSelectedAccounts"><LoaderCircle v-if="accountValidationBusy" :size="15" class="spin" /><ShieldCheck v-else :size="15" />批量验活</NButton><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" :disabled="accountValidationBusy || accountExportBusy" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
           <template #end><div class="filter-group"><span v-if="accountFilters.relation_label" class="relation-filter"><span :title="accountFilters.relation_label">{{ accountFilters.relation_label }}</span><NButton type="button" variant="outline" size="xs" icon-only title="清除关联筛选" @click="clearAccountRelationFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput v-model="accountFilters.q" size="sm" placeholder="搜索账号、来源或 ID" aria-label="搜索账号" @keyup.enter="searchAccounts" /></div><FilterSelect v-model="accountFilters.has_refresh_token" :options="refreshTokenOptions" size="sm" aria-label="Refresh Token 筛选" @update:model-value="searchAccounts" /><FilterSelect v-model="accountFilters.status" :options="accountStatusOptions" size="sm" aria-label="账号状态筛选" @update:model-value="searchAccounts" /></div></template>
         </ToolbarShell>
         <CalloutBox v-if="accountMessage" :tone="messageTone(accountMessage)" variant="soft" size="sm" class="section-message">{{ accountMessage }}</CalloutBox>
@@ -954,16 +1238,42 @@ onMounted(async () => {
         <TableShell class="data-table redemptions-table" :show-empty="!redemptions.length" :empty-colspan="6" empty-title="暂无兑换记录" empty-description="用户兑换后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allRedemptionsSelected" :indeterminate="selectedRedemptionsOnPage > 0 && !allRedemptionsSelected" aria-label="选择当前页兑换记录" @update:model-value="toggleAllRedemptions" /></th><th>任务</th><th>CDK</th><th>请求 / 交付</th><th>创建时间（东八区）</th><th>状态</th></tr></template><tr v-for="item in redemptions" :key="item.id"><td class="selection-cell"><NCheckbox :model-value="selectedRedemptionIds.includes(item.id)" :aria-label="`选择兑换任务 ${item.id.slice(0, 8)}`" @update:model-value="toggleRedemption(item.id, $event)" /></td><td><b>{{ item.id.slice(0, 8) }}</b><small>{{ item.error_message || '—' }}</small></td><td class="relation-cell"><div class="relation-stack"><button v-for="cdk in item.cdks" :key="cdk.id" class="relation-code" type="button" :title="`查看 ${cdkLabel(cdk)} 关联的账号`" @click="openAccountsForCdk(cdk)">{{ cdkLabel(cdk) }}</button><span v-if="!item.cdks.length">—</span></div></td><td><div class="delivery-summary"><span>{{ item.requested_count }} / {{ item.delivered_count }}</span><button v-if="item.delivered_count" class="relation-count" type="button" title="查看本次兑换交付的账号" @click="openAccountsForRedemption(item)"><Users :size="14" /><span>查看账号</span></button></div></td><td>{{ formatDate(item.created_at) }}</td><td><StatusPill :label="statusLabel(item.status)" :tone="statusTone(item.status)" size="xs" radius="rounded" /></td></tr></TableShell>
         <div v-if="redemptionTotal" class="pagination-bar" aria-label="兑换记录分页"><span>{{ pageRange(redemptionTotal, redemptionPage, redemptionPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="redemptionPageSize" :options="pageSizeOptions" size="sm" aria-label="兑换记录每页条数" @update:model-value="changeRedemptionPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="redemptionPage <= 1" @click="changeRedemptionPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ redemptionPage }} / {{ pageCount(redemptionTotal, redemptionPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="redemptionPage >= pageCount(redemptionTotal, redemptionPageSize)" @click="changeRedemptionPage(1)"><ChevronRight :size="15" /></NButton></div></div>
       </section>
+
+      <section v-if="activeView === 'logs'" class="workspace-section logs-view">
+        <ToolbarShell class="list-toolbar" stack-on-mobile>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>任务</span><strong>{{ operationTaskTotal }}</strong><span>条</span></div><RefreshCw :size="15" class="task-refresh-icon" /><span v-if="accountValidationTask?.status === 'running'" class="task-live-label">验活任务实时更新</span></div></template>
+          <template #end><div class="filter-group"><FilterSelect v-model="operationTaskFilters.task_type" :options="[{ label: '全部任务', value: '' }, { label: '手动验活', value: 'manual_validation' }, { label: '导入预验活', value: 'account_import_validation' }, { label: '兑换导出', value: 'redemption_export' }, { label: '补发导出', value: 'redelivery_export' } ]" size="sm" aria-label="任务类型筛选" @update:model-value="filterOperationTasks" /><FilterSelect v-model="operationTaskFilters.status" :options="[{ label: '全部状态', value: '' }, { label: '排队中', value: 'queued' }, { label: '处理中', value: 'running' }, { label: '已完成', value: 'completed' }, { label: '失败', value: 'failed' } ]" size="sm" aria-label="任务状态筛选" @update:model-value="filterOperationTasks" /></div></template>
+        </ToolbarShell>
+        <TableShell class="data-table operation-tasks-table" :show-empty="!operationTasks.length" :empty-colspan="6" empty-title="暂无操作任务" empty-description="验活或导出后会显示任务进度。" variant="soft" size="sm"><template #head><tr><th>任务</th><th>类型</th><th>进度</th><th>结果</th><th>创建时间（东八区）</th><th>状态</th></tr></template><tr v-for="task in operationTasks" :key="task.id"><td><b>{{ task.id.slice(0, 8) }}</b><small>{{ task.resource_id ? `资源 ${task.resource_id.slice(0, 8)}` : '—' }}</small></td><td>{{ taskTypeLabel(task.task_type) }}</td><td><div class="task-progress"><div class="progress-track"><span :style="{ width: `${task.percent}%` }" /></div><small>{{ task.processed }} / {{ task.total }}（{{ task.percent }}%）</small></div></td><td><span class="task-result-counts">有效 {{ task.valid_count }} · 无效 {{ task.invalid_count }} · 待确认 {{ task.inconclusive_count }} · 跳过 {{ task.skipped_count }}</span></td><td>{{ formatDate(task.created_at) }}</td><td><StatusPill :label="statusLabel(task.status)" :tone="statusTone(task.status)" size="xs" radius="rounded" /></td></tr></TableShell>
+        <div class="logs-subsection">
+          <ToolbarShell class="list-toolbar" stack-on-mobile>
+            <template #start><div class="selection-actions"><div class="list-summary"><span>日志</span><strong>{{ operationLogTotal }}</strong><span>条</span></div></div></template>
+            <template #end><div class="filter-group"><div class="search-field"><Search :size="15" /><NInput v-model="operationLogFilters.q" size="sm" placeholder="搜索任务、账号或消息" aria-label="搜索操作日志" @keyup.enter="searchOperationLogs" /></div><FilterSelect v-model="operationLogFilters.operation_type" :options="[{ label: '全部操作', value: '' }, { label: '手动验活', value: 'manual_validation' }, { label: '导入预验活', value: 'account_import_validation' }, { label: '兑换导出', value: 'redemption_export' }, { label: '补发导出', value: 'redelivery_export' }, { label: '账号导入', value: 'account_import' }, { label: '兑换', value: 'redemption' } ]" size="sm" aria-label="操作类型筛选" @update:model-value="searchOperationLogs" /><FilterSelect v-model="operationLogFilters.outcome" :options="[{ label: '全部结果', value: '' }, { label: '有效', value: 'valid' }, { label: '无效', value: 'invalid' }, { label: '待确认', value: 'inconclusive' }, { label: '跳过', value: 'skipped' }, { label: '失败', value: 'failed' }, { label: '已完成', value: 'completed' } ]" size="sm" aria-label="日志结果筛选" @update:model-value="searchOperationLogs" /></div></template>
+          </ToolbarShell>
+          <TableShell class="data-table operation-logs-table" :show-empty="!operationLogs.length" :empty-colspan="5" empty-title="暂无操作日志" empty-description="当前筛选没有匹配记录。" variant="soft" size="sm"><template #head><tr><th>时间（东八区）</th><th>操作</th><th>账号</th><th>结果</th><th>消息</th></tr></template><tr v-for="log in operationLogs" :key="log.id"><td>{{ formatDate(log.created_at) }}</td><td><b>{{ taskTypeLabel(log.operation_type) }}</b><small>{{ log.task_id ? `任务 ${log.task_id.slice(0, 8)}` : (log.resource_id ? `资源 ${log.resource_id.slice(0, 8)}` : '—') }}</small></td><td><b>{{ log.account_email || '—' }}</b><small>{{ log.account_id || '—' }}</small></td><td><StatusPill :label="outcomeLabel(log.outcome)" :tone="statusTone(log.outcome)" size="xs" radius="rounded" /></td><td><span class="log-message" :title="log.message">{{ log.message || '—' }}</span></td></tr></TableShell>
+          <div v-if="operationLogTotal" class="pagination-bar" aria-label="操作日志分页"><span>{{ pageRange(operationLogTotal, operationLogPage, operationLogPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="operationLogPageSize" :options="pageSizeOptions" size="sm" aria-label="操作日志每页条数" @update:model-value="changeOperationLogPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="operationLogPage <= 1" @click="changeOperationLogPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ operationLogPage }} / {{ pageCount(operationLogTotal, operationLogPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="operationLogPage >= pageCount(operationLogTotal, operationLogPageSize)" @click="changeOperationLogPage(1)"><ChevronRight :size="15" /></NButton></div></div>
+        </div>
+        <div v-if="operationTaskTotal" class="pagination-bar" aria-label="操作任务分页"><span>{{ pageRange(operationTaskTotal, operationTaskPage, operationTaskPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="operationTaskPageSize" :options="pageSizeOptions" size="sm" aria-label="操作任务每页条数" @update:model-value="changeOperationTaskPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="operationTaskPage <= 1" @click="changeOperationTaskPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ operationTaskPage }} / {{ pageCount(operationTaskTotal, operationTaskPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="operationTaskPage >= pageCount(operationTaskTotal, operationTaskPageSize)" @click="changeOperationTaskPage(1)"><ChevronRight :size="15" /></NButton></div></div>
+      </section>
     </main>
   </div>
 
   <ModalShell :open="accountImportOpen" title="导入账号" description="上传账号文件，预览无误后写入账号池。" max-width="880px" @close="accountImportOpen = false">
     <div class="import-dialog-body">
-      <div class="dropzone" :class="{ occupied: importFile }" @dragover.prevent @drop="onDrop" @click="chooseImportFile">
-        <input ref="importInput" type="file" accept=".json,.csv,.txt,.zip" hidden @change="onImportFileChange" />
-        <FileUp :size="24" />
-        <strong>{{ importFile ? importFile.name : '选择账号文件' }}</strong>
-        <span>{{ importFile ? `${Math.ceil(importFile.size / 1024)} KB` : 'JSON · CSV · TXT · ZIP' }}</span>
+      <div class="import-file-picker">
+        <div class="dropzone" :class="{ occupied: importFiles.length }" @dragover.prevent @drop="onDrop" @click="chooseImportFile">
+          <input ref="importInput" type="file" accept=".json,.csv,.txt,.zip" multiple hidden @change="onImportFileChange" />
+          <FileUp :size="24" />
+          <strong>{{ importFiles.length ? `已选择 ${importFiles.length} 个文件` : '选择账号文件' }}</strong>
+          <span>{{ importFiles.length ? `总计 ${formatFileSize(importTotalSize)}` : 'JSON · CSV · TXT · ZIP' }}</span>
+        </div>
+        <div v-if="importFiles.length" class="import-file-list" aria-label="已选择的账号文件">
+          <div v-for="(file, index) in importFiles" :key="`${file.name}-${file.lastModified}-${file.size}-${index}`" class="import-file-row">
+            <span class="import-file-name" :title="file.name">{{ file.name }}</span>
+            <span class="import-file-size">{{ formatFileSize(file.size) }}</span>
+            <button class="import-file-remove" type="button" :aria-label="`移除 ${file.name}`" title="移除文件" @click.stop="removeImportFile(index)"><X :size="14" /></button>
+          </div>
+        </div>
       </div>
       <div class="import-dialog-options">
         <FormField label="重复账号"><FilterSelect v-model="importOptions.duplicate_strategy" :options="[{ label: '跳过', value: 'skip' }, { label: '补充空字段', value: 'fill_missing' }, { label: '更新凭据', value: 'replace' }]" aria-label="重复账号处理策略" /></FormField>
@@ -975,7 +1285,7 @@ onMounted(async () => {
         <TableShell :show-empty="!importPreview.samples.length" :empty-colspan="5" empty-title="暂无预览记录" variant="soft" size="sm"><template #head><tr><th>记录</th><th>账号</th><th>AT</th><th>RT</th><th>结果</th></tr></template><tr v-for="sample in importPreview.samples" :key="sample.locator"><td>{{ sample.locator }}</td><td>{{ sample.email }}</td><td>{{ sample.has_access_token ? sample.access_token_hint : '—' }}</td><td>{{ sample.has_refresh_token ? sample.refresh_token_hint : '—' }}</td><td><StatusPill :label="sample.duplicate ? '重复' : '可导入'" :tone="sample.duplicate ? 'warning' : 'success'" size="xs" radius="rounded" /></td></tr></TableShell>
       </div>
     </div>
-    <template #footer><NButton type="button" variant="outline" size="sm" @click="accountImportOpen = false">取消</NButton><NButton type="button" variant="outline" size="sm" :disabled="!importFile || importBusy" @click="previewImport"><LoaderCircle v-if="importBusy" :size="15" class="spin" /><PackageOpen v-else :size="15" />预览</NButton><NButton type="button" variant="primary" size="sm" :disabled="!importPreview || importBusy" @click="commitImport"><Upload :size="15" />确认导入</NButton></template>
+    <template #footer><NButton type="button" variant="outline" size="sm" @click="accountImportOpen = false">取消</NButton><NButton type="button" variant="outline" size="sm" :disabled="!importFiles.length || importBusy" @click="previewImport"><LoaderCircle v-if="importBusy" :size="15" class="spin" /><PackageOpen v-else :size="15" />预览</NButton><NButton type="button" variant="primary" size="sm" :disabled="!importPreview || importBusy" @click="commitImport"><Upload :size="15" />确认导入</NButton></template>
   </ModalShell>
 
   <ModalShell :open="cdkGeneratorOpen" title="生成 CDK" description="设置生成数量、账号额度和交付文件格式。" max-width="720px" @close="cdkGeneratorOpen = false">

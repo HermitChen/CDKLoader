@@ -321,14 +321,22 @@ def _parse_by_suffix(filename: str, content: bytes, settings: Settings, source_l
 
 
 def parse_import_file(filename: str, content: bytes, settings: Settings) -> ParsedBatch:
-    if not filename:
-        raise ImportParseException("缺少文件名")
-    if not content:
-        raise ImportParseException("上传文件为空")
-    if len(content) > settings.max_upload_bytes:
-        raise ImportParseException("上传文件超过大小限制")
-    batch = _parse_by_suffix(filename, content, settings)
-    if len(batch.records) > settings.max_import_accounts:
-        raise ImportParseException("账号数量超过单次导入限制")
-    return batch
+    return parse_import_files([(filename, content)], settings)
 
+
+def parse_import_files(files: list[tuple[str, bytes]], settings: Settings) -> ParsedBatch:
+    if not files:
+        raise ImportParseException("缺少文件")
+
+    batch = ParsedBatch()
+    for filename, content in files:
+        if not filename:
+            raise ImportParseException("缺少文件名")
+        if not content:
+            raise ImportParseException("上传文件为空")
+        if len(content) > settings.max_upload_bytes:
+            raise ImportParseException("上传文件超过大小限制")
+        _merge_batch(batch, _parse_by_suffix(filename, content, settings))
+        if len(batch.records) > settings.max_import_accounts:
+            raise ImportParseException("账号数量超过单次导入限制")
+    return batch

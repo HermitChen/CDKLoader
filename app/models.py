@@ -104,6 +104,56 @@ class ValidationAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
+class OperationTask(Base):
+    __tablename__ = "operation_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_type: Mapped[str] = mapped_column(String(48), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    valid_count: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_count: Mapped[int] = mapped_column(Integer, default=0)
+    inconclusive_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    logs: Mapped[list["OperationLog"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_operation_tasks_type_status", "task_type", "status"),)
+
+
+class OperationLog(Base):
+    __tablename__ = "operation_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("operation_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    operation_type: Mapped[str] = mapped_column(String(48), index=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    account_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    message: Mapped[str] = mapped_column(String(500), default="")
+    details: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+    task: Mapped["OperationTask | None"] = relationship(back_populates="logs")
+
+    __table_args__ = (Index("ix_operation_logs_type_created", "operation_type", "created_at"),)
+
+
 class CDK(Base):
     __tablename__ = "cdks"
 

@@ -23,12 +23,13 @@ def settings(tmp_path: Path) -> Settings:
         validation_concurrency=2,
         redelivery_window_seconds=1800,
         public_base_url="http://testserver",
-        max_upload_bytes=1024 * 1024,
+        max_upload_bytes=20 * 1024 * 1024,
         max_import_accounts=100,
         max_zip_files=20,
         max_zip_uncompressed_bytes=1024 * 1024,
         oauth_client_id="test-client",
         oauth_redirect_uri="",
+        export_dir=str(tmp_path / "exports"),
     )
 
 

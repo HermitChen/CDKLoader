@@ -37,6 +37,39 @@ def test_account_filter_and_bulk_delete_skip_reserved(client, admin_headers):
     assert deleted.json()["skipped"] == [{"id": reserved_id, "reason": "账号正在被兑换任务预约"}]
 
 
+def test_manual_batch_validation_skips_unavailable_accounts(client, admin_headers):
+    _import_accounts(client, admin_headers, count=3)
+    accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"limit": 0},
+    ).json()["items"]
+    reserved_id, delivered_id, eligible_id = [account["id"] for account in accounts]
+
+    with client.app.state.session_factory.begin() as session:
+        session.get(Account, reserved_id).status = "reserved"
+        session.get(Account, delivered_id).status = "delivered"
+        session.get(Account, eligible_id).status = "quarantined"
+
+    response = client.post(
+        "/api/v1/admin/accounts/validate",
+        headers=admin_headers,
+        json={"ids": [reserved_id, delivered_id, eligible_id, "missing-account", eligible_id]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "accepted": 1,
+        "skipped": [
+            {"id": reserved_id, "reason": "账号正在被兑换任务预约"},
+            {"id": delivered_id, "reason": "账号已交付"},
+            {"id": "missing-account", "reason": "账号不存在"},
+        ],
+    }
+    with client.app.state.session_factory() as session:
+        assert session.get(Account, eligible_id).status == "available"
+
+
 def test_account_filter_by_refresh_token(client, admin_headers):
     _import_accounts(client, admin_headers, count=3)
     accounts = client.get(

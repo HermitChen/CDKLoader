@@ -8,6 +8,8 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -247,6 +249,55 @@ def build_account_archive(
     return buffer.getvalue(), _timestamped_zip_filename(), "application/zip"
 
 
+def build_delivery_archive_to_path(
+    deliveries: list[ExportDelivery],
+    security: SecurityManager,
+    path: str | Path,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[str, str, int]:
+    """Write a delivery archive incrementally and report account-level progress."""
+    if not deliveries:
+        raise ValueError("没有可导出的关联账号")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    deliveries_by_cdk: defaultdict[str, list[ExportDelivery]] = defaultdict(list)
+    cdk_settings: dict[str, ExportDelivery] = {}
+    for delivery in sorted(deliveries, key=lambda item: item.ordinal):
+        deliveries_by_cdk[delivery.cdk_id].append(delivery)
+        cdk_settings.setdefault(delivery.cdk_id, delivery)
+
+    total = len(deliveries)
+    processed = 0
+    used_stems: set[str] = set()
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        for cdk_id, settings in sorted(cdk_settings.items(), key=lambda item: item[1].ordinal):
+            cdk_deliveries = deliveries_by_cdk[cdk_id]
+            if settings.export_format == "json":
+                for index, delivery in enumerate(cdk_deliveries, start=1):
+                    stem = _archive_stem(delivery.account, index, used_stems)
+                    archive.writestr(f"cpa/{stem}.json", _render_cpa(delivery.account, security))
+                    archive.writestr(
+                        f"sub2api/{stem}_sub2api.json",
+                        _render_sub2api(delivery.account, security),
+                    )
+                    processed += 1
+                    if on_progress:
+                        on_progress(processed, total)
+                continue
+
+            records = []
+            for delivery in cdk_deliveries:
+                records.append(serialize_account(delivery.account, security, _export_fields(settings.export_fields)))
+                processed += 1
+                if on_progress:
+                    on_progress(processed, total)
+            body, extension, _ = _render(records, settings.export_format)
+            archive.writestr(f"accounts_{settings.cdk_prefix}.{extension}", body)
+
+    return target.name, "application/zip", total
+
+
 def _export_fields(value: str) -> list[str]:
     try:
         fields = json.loads(value or "[]")
@@ -290,7 +341,7 @@ def _build_delivery_download(deliveries: list[ExportDelivery], security: Securit
     return buffer.getvalue(), _timestamped_zip_filename(), "application/zip"
 
 
-def build_download(session: Session, redemption_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+def _load_redemption_export_deliveries(session: Session, redemption_id: str) -> list[ExportDelivery]:
     redemption = session.scalar(
         select(Redemption)
         .options(joinedload(Redemption.cdks).joinedload(RedemptionCDK.cdk))
@@ -321,10 +372,14 @@ def build_download(session: Session, redemption_id: str, security: SecurityManag
                     ordinal=relation.ordinal * 100_000 + index,
                 )
             )
-    return _build_delivery_download(export_deliveries, security)
+    return export_deliveries
 
 
-def build_redelivery_download(session: Session, redelivery_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+def build_download(session: Session, redemption_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+    return _build_delivery_download(_load_redemption_export_deliveries(session, redemption_id), security)
+
+
+def _load_redelivery_export_deliveries(session: Session, redelivery_id: str) -> list[ExportDelivery]:
     redelivery = session.scalar(
         select(Redelivery).options(selectinload(Redelivery.items)).where(Redelivery.id == redelivery_id)
     )
@@ -348,4 +403,21 @@ def build_redelivery_download(session: Session, redelivery_id: str, security: Se
         )
         for item in redelivery.items
     ]
-    return _build_delivery_download(export_deliveries, security)
+    return export_deliveries
+
+
+def build_redelivery_download(session: Session, redelivery_id: str, security: SecurityManager) -> tuple[bytes, str, str]:
+    return _build_delivery_download(_load_redelivery_export_deliveries(session, redelivery_id), security)
+
+
+def load_export_deliveries(
+    session: Session,
+    *,
+    redemption_id: str | None = None,
+    redelivery_id: str | None = None,
+) -> list[ExportDelivery]:
+    if bool(redemption_id) == bool(redelivery_id):
+        raise ValueError("必须指定一种导出任务")
+    if redemption_id:
+        return _load_redemption_export_deliveries(session, redemption_id)
+    return _load_redelivery_export_deliveries(session, redelivery_id or "")

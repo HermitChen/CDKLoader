@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
 
@@ -24,6 +26,46 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+_SIZE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt](?:i?b)?|b)?\s*$", re.IGNORECASE)
+_SIZE_UNITS = {
+    "B": 1,
+    "K": 1024,
+    "KB": 1024,
+    "KIB": 1024,
+    "M": 1024**2,
+    "MB": 1024**2,
+    "MIB": 1024**2,
+    "G": 1024**3,
+    "GB": 1024**3,
+    "GIB": 1024**3,
+    "T": 1024**4,
+    "TB": 1024**4,
+    "TIB": 1024**4,
+}
+
+
+def parse_size_bytes(value: str | int) -> int:
+    """Parse a byte setting such as ``10M``, ``1.5G`` or ``10485760``."""
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("文件大小不能为负数")
+        return value
+
+    match = _SIZE_PATTERN.fullmatch(str(value))
+    if not match:
+        raise ValueError(f"无效的文件大小：{value!r}，示例：100M、1G 或 104857600")
+    try:
+        amount = Decimal(match.group(1))
+    except InvalidOperation as exc:
+        raise ValueError(f"无效的文件大小：{value!r}") from exc
+
+    unit = (match.group(2) or "B").upper()
+    size = int(amount * _SIZE_UNITS[unit])
+    if size < 1:
+        raise ValueError("文件大小必须大于 0")
+    return size
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str
@@ -43,6 +85,9 @@ class Settings:
     max_zip_uncompressed_bytes: int
     oauth_client_id: str
     oauth_redirect_uri: str
+    operation_log_retention_days: int = 30
+    export_retention_seconds: int = 86400
+    export_dir: str = ""
 
     @property
     def is_sqlite(self) -> bool:
@@ -64,7 +109,7 @@ def get_settings() -> Settings:
         validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "6"))),
         redelivery_window_seconds=max(0, int(os.getenv("REDELIVERY_WINDOW_SECONDS", "1800"))),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:1456").rstrip("/"),
-        max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024))),
+        max_upload_bytes=parse_size_bytes(os.getenv("MAX_UPLOAD_BYTES", "100M")),
         max_import_accounts=int(os.getenv("MAX_IMPORT_ACCOUNTS", "5000")),
         max_zip_files=int(os.getenv("MAX_ZIP_FILES", "1000")),
         max_zip_uncompressed_bytes=int(
@@ -72,4 +117,7 @@ def get_settings() -> Settings:
         ),
         oauth_client_id=os.getenv("OPENAI_OAUTH_CLIENT_ID", "app_2SKx67EdpoN0G6j64rFvigXD"),
         oauth_redirect_uri=os.getenv("OPENAI_OAUTH_REDIRECT_URI", ""),
+        operation_log_retention_days=max(1, int(os.getenv("OPERATION_LOG_RETENTION_DAYS", "30"))),
+        export_retention_seconds=max(300, int(os.getenv("EXPORT_RETENTION_SECONDS", "86400"))),
+        export_dir=os.getenv("EXPORT_DIR", str(PROJECT_ROOT / "data" / "exports")),
     )

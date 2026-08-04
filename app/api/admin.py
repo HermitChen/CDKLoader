@@ -4,17 +4,37 @@ import json
 import secrets
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from ..config import Settings
 from ..dependencies import get_db, get_security, get_settings_from_app, require_admin
-from ..models import Account, AccountImport, AccountImportError, CDK, DeliveryItem, Redemption, RedemptionCDK, utcnow
+from ..models import (
+    Account,
+    AccountImport,
+    AccountImportError,
+    CDK,
+    DeliveryItem,
+    OperationLog,
+    OperationTask,
+    Redemption,
+    RedemptionCDK,
+    utcnow,
+)
 from ..schemas import AccountExportRequest, AccountValidateRequest, AdminLoginRequest, BulkDeleteRequest, CDKGenerateRequest, CDKImportRequest
 from ..security import SecurityManager
 from ..services.import_service import AccountImportService, serialize_import
-from ..services.importers import ImportParseException, parse_import_file
+from ..services.importers import ImportParseException, ParsedBatch, parse_import_files
 from ..services.exporter import build_account_archive
+from ..services.operations import (
+    add_operation_log,
+    complete_operation_task,
+    create_operation_task,
+    serialize_operation_log,
+    serialize_operation_task,
+    start_operation_task,
+)
 from ..services.redemption import refresh_cdk_status, serialize_redemption
 from ..services.validator import apply_validation
 from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
@@ -134,24 +154,123 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     }
 
 
+@router.get("/operation-tasks", dependencies=[Depends(require_admin)])
+def list_operation_tasks(
+    db: Session = Depends(get_db),
+    task_type: str | None = Query(default=None, max_length=48),
+    current_status: str | None = Query(default=None, alias="status", max_length=24),
+    resource_id: str | None = Query(default=None, max_length=36),
+    limit: int = Query(default=20, ge=0, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    query = select(OperationTask)
+    if task_type:
+        query = query.where(OperationTask.task_type == task_type)
+    if current_status:
+        query = query.where(OperationTask.status == current_status)
+    if resource_id:
+        query = query.where(OperationTask.resource_id == resource_id)
+    total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
+    if limit == 0:
+        offset = 0
+    items_query = query.order_by(OperationTask.created_at.desc()).offset(offset)
+    if limit:
+        items_query = items_query.limit(limit)
+    items = db.scalars(items_query).all()
+    return {"total": total, "items": [serialize_operation_task(item) for item in items]}
+
+
+@router.get("/operation-tasks/{task_id}", dependencies=[Depends(require_admin)])
+def get_operation_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.get(OperationTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="操作任务不存在")
+    logs = db.scalars(
+        select(OperationLog)
+        .where(OperationLog.task_id == task_id)
+        .order_by(OperationLog.created_at.desc())
+        .limit(100)
+    ).all()
+    payload = serialize_operation_task(task)
+    payload["logs"] = [serialize_operation_log(item) for item in logs]
+    return payload
+
+
+@router.get("/operation-logs", dependencies=[Depends(require_admin)])
+def list_operation_logs(
+    db: Session = Depends(get_db),
+    operation_type: str | None = Query(default=None, max_length=48),
+    outcome: str | None = Query(default=None, max_length=32),
+    task_id: str | None = Query(default=None, max_length=36),
+    q: str | None = Query(default=None, max_length=320),
+    limit: int = Query(default=30, ge=0, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    query = select(OperationLog, Account.email).outerjoin(Account, Account.id == OperationLog.account_id)
+    if operation_type:
+        query = query.where(OperationLog.operation_type == operation_type)
+    if outcome:
+        query = query.where(OperationLog.outcome == outcome)
+    if task_id:
+        query = query.where(OperationLog.task_id == task_id)
+    if q and (term := q.strip()):
+        pattern = f"%{term}%"
+        query = query.where(
+            or_(
+                OperationLog.task_id.ilike(pattern),
+                OperationLog.account_id.ilike(pattern),
+                OperationLog.resource_id.ilike(pattern),
+                OperationLog.message.ilike(pattern),
+                Account.email.ilike(pattern),
+            )
+        )
+    count_query = query.with_only_columns(OperationLog.id).order_by(None).subquery()
+    total = int(db.scalar(select(func.count()).select_from(count_query)) or 0)
+    if limit == 0:
+        offset = 0
+    items_query = query.order_by(OperationLog.created_at.desc()).offset(offset)
+    if limit:
+        items_query = items_query.limit(limit)
+    items = db.execute(items_query).all()
+    return {
+        "total": total,
+        "items": [serialize_operation_log(log, account_email=email) for log, email in items],
+    }
+
+
 async def _read_upload(upload: UploadFile, max_bytes: int) -> bytes:
-    content = await upload.read(max_bytes + 1)
-    if len(content) > max_bytes:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="上传文件超过大小限制")
-    return content
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(1024 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="上传文件超过大小限制")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_import_files(uploads: list[UploadFile], max_bytes: int) -> list[tuple[str, bytes]]:
+    return [
+        (upload.filename or "upload", await _read_upload(upload, max_bytes))
+        for upload in uploads
+    ]
+
+
+def _parse_import_files(files: list[tuple[str, bytes]], settings: Settings) -> ParsedBatch:
+    try:
+        return parse_import_files(files, settings)
+    except ImportParseException as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/account-imports/preview", dependencies=[Depends(require_admin)])
 async def preview_account_import(
     request: Request,
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
-    content = await _read_upload(file, request.app.state.settings.max_upload_bytes)
-    try:
-        batch = parse_import_file(file.filename or "upload", content, request.app.state.settings)
-    except ImportParseException as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    files = await _read_import_files(file, request.app.state.settings.max_upload_bytes)
+    batch = _parse_import_files(files, request.app.state.settings)
     service: AccountImportService = request.app.state.import_service
     return service.preview(db, batch)
 
@@ -160,35 +279,90 @@ async def preview_account_import(
 async def create_account_import(
     request: Request,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     duplicate_strategy: str = Form("skip"),
     prevalidate: bool = Form(True),
     db: Session = Depends(get_db),
 ):
     if duplicate_strategy not in {"skip", "fill_missing", "replace"}:
         raise HTTPException(status_code=400, detail="不支持的重复处理策略")
-    content = await _read_upload(file, request.app.state.settings.max_upload_bytes)
-    try:
-        batch = parse_import_file(file.filename or "upload", content, request.app.state.settings)
-    except ImportParseException as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    files = await _read_import_files(file, request.app.state.settings.max_upload_bytes)
+    batch = _parse_import_files(files, request.app.state.settings)
+    content = b"".join(item[1] for item in files)
     service: AccountImportService = request.app.state.import_service
     result = service.commit(
         db,
-        filename=file.filename or "upload",
+        filename=", ".join(item[0] for item in files),
         content=content,
         batch=batch,
         duplicate_strategy=duplicate_strategy,
     )
-    db.commit()
+    validation_task: OperationTask | None = None
+    add_operation_log(
+        db,
+        operation_type="account_import",
+        outcome="submitted",
+        resource_id=result.account_import.id,
+        message="账号导入已提交",
+        details={
+            "file_count": len(files),
+            "inserted_count": result.account_import.inserted_count,
+            "updated_count": result.account_import.updated_count,
+            "duplicate_count": result.account_import.duplicate_count,
+            "failed_count": result.account_import.failed_count,
+        },
+    )
     if prevalidate and result.account_ids:
-        background_tasks.add_task(service.prevalidate, request.app.state.session_factory, result.account_import.id, result.account_ids)
+        validation_task = create_operation_task(
+            db,
+            task_type="account_import_validation",
+            resource_id=result.account_import.id,
+            total=len(result.account_ids),
+        )
+        add_operation_log(
+            db,
+            operation_type="account_import_validation",
+            outcome="queued",
+            task_id=validation_task.id,
+            resource_id=result.account_import.id,
+            message="导入后的预验活任务已排队",
+            details={"total": len(result.account_ids)},
+        )
+    db.commit()
+    if validation_task:
+        background_tasks.add_task(
+            service.prevalidate,
+            request.app.state.session_factory,
+            result.account_import.id,
+            result.account_ids,
+            validation_task.id,
+            request.app.state.settings,
+        )
     elif result.account_import.status == "validating":
         result.account_import.status = "completed"
         result.account_import.completed_at = utcnow()
         db.add(result.account_import)
+        add_operation_log(
+            db,
+            operation_type="account_import",
+            outcome="completed",
+            resource_id=result.account_import.id,
+            message="账号导入已完成",
+        )
         db.commit()
-    return serialize_import(result.account_import)
+    elif result.account_import.status == "completed":
+        add_operation_log(
+            db,
+            operation_type="account_import",
+            outcome="completed",
+            resource_id=result.account_import.id,
+            message="账号导入已完成",
+        )
+        db.commit()
+    payload = serialize_import(result.account_import)
+    if validation_task:
+        payload["validation_task_id"] = validation_task.id
+    return payload
 
 
 @router.get("/account-imports/{import_id}", dependencies=[Depends(require_admin)])
@@ -274,6 +448,14 @@ def export_accounts(
     if len(accounts) != len(account_ids):
         raise HTTPException(status_code=409, detail="部分选中账号不存在，请刷新后重试")
     content, filename, media_type = build_account_archive(accounts, security)
+    add_operation_log(
+        db,
+        operation_type="account_export",
+        outcome="completed",
+        message="管理员账号导出已完成",
+        details={"count": len(accounts), "filename": filename},
+    )
+    db.commit()
     return Response(
         content=content,
         media_type=media_type,
@@ -306,18 +488,187 @@ def bulk_delete_accounts(payload: BulkDeleteRequest, db: Session = Depends(get_d
     return {"deleted": deleted, "skipped": skipped}
 
 
-def _validate_accounts_task(factory, validator, account_ids: list[str]) -> None:
+def _validate_accounts_task(factory, validator, settings: Settings, task_id: str, account_ids: list[str]) -> None:
+    with factory.begin() as session:
+        task = session.get(OperationTask, task_id)
+        if not task or task.status not in {"queued", "running"}:
+            return
+        start_operation_task(task)
+        add_operation_log(
+            session,
+            operation_type="manual_validation",
+            outcome="started",
+            task_id=task.id,
+            message="批量验活任务开始执行",
+            details={"total": task.total},
+        )
+
     for account_id in account_ids:
-        with factory.begin() as session:
-            account = session.get(Account, account_id)
-            if account and account.status not in {"reserved", "delivered"}:
-                apply_validation(session, account, validator)
+        try:
+            with factory.begin() as session:
+                task = session.get(OperationTask, task_id)
+                if not task or task.status != "running":
+                    return
+                account = session.get(Account, account_id)
+                if not account:
+                    task.processed += 1
+                    task.skipped_count += 1
+                    add_operation_log(
+                        session,
+                        operation_type="manual_validation",
+                        outcome="skipped",
+                        task_id=task_id,
+                        account_id=account_id,
+                        message="账号不存在",
+                    )
+                    continue
+                if account.status in {"reserved", "delivered"}:
+                    task.processed += 1
+                    task.skipped_count += 1
+                    add_operation_log(
+                        session,
+                        operation_type="manual_validation",
+                        outcome="skipped",
+                        task_id=task_id,
+                        account_id=account.id,
+                        message="账号状态不允许验活",
+                        details={"status": account.status},
+                    )
+                    continue
+
+                result = apply_validation(session, account, validator)
+                task.processed += 1
+                if result.outcome == "valid":
+                    task.valid_count += 1
+                elif result.outcome == "invalid":
+                    task.invalid_count += 1
+                else:
+                    task.inconclusive_count += 1
+                add_operation_log(
+                    session,
+                    operation_type="manual_validation",
+                    outcome=result.outcome,
+                    task_id=task_id,
+                    account_id=account.id,
+                    message=result.message or f"验活结果：{result.outcome}",
+                    details={
+                        "error_type": result.error_type,
+                        "validated_via": result.validated_via,
+                        "latency_ms": result.latency_ms,
+                    },
+                )
+        except Exception:
+            with factory.begin() as session:
+                task = session.get(OperationTask, task_id)
+                if not task or task.status != "running":
+                    return
+                task.processed += 1
+                task.failed_count += 1
+                add_operation_log(
+                    session,
+                    operation_type="manual_validation",
+                    outcome="failed",
+                    task_id=task_id,
+                    account_id=account_id,
+                    message="验活执行异常",
+                )
+
+    with factory.begin() as session:
+        task = session.get(OperationTask, task_id)
+        if not task or task.status != "running":
+            return
+        task.processed = max(task.processed, task.total)
+        complete_operation_task(task, settings)
+        add_operation_log(
+            session,
+            operation_type="manual_validation",
+            outcome="completed",
+            task_id=task_id,
+            message="批量验活任务已完成",
+            details={
+                "total": task.total,
+                "valid_count": task.valid_count,
+                "invalid_count": task.invalid_count,
+                "inconclusive_count": task.inconclusive_count,
+                "skipped_count": task.skipped_count,
+                "failed_count": task.failed_count,
+            },
+        )
 
 
 @router.post("/accounts/validate", dependencies=[Depends(require_admin)])
-def validate_accounts(payload: AccountValidateRequest, request: Request, background_tasks: BackgroundTasks):
-    background_tasks.add_task(_validate_accounts_task, request.app.state.session_factory, request.app.state.validator, payload.ids)
-    return {"accepted": len(payload.ids)}
+def validate_accounts(
+    payload: AccountValidateRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    account_ids = list(dict.fromkeys(payload.ids))
+    accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all()
+    accounts_by_id = {account.id: account for account in accounts}
+    accepted_ids: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    for account_id in account_ids:
+        account = accounts_by_id.get(account_id)
+        if not account:
+            skipped.append({"id": account_id, "reason": "账号不存在"})
+        elif account.status == "reserved":
+            skipped.append({"id": account_id, "reason": "账号正在被兑换任务预约"})
+        elif account.status == "delivered":
+            skipped.append({"id": account_id, "reason": "账号已交付"})
+        else:
+            accepted_ids.append(account_id)
+
+    task = create_operation_task(
+        db,
+        task_type="manual_validation",
+        total=len(account_ids),
+        processed=len(skipped),
+        skipped_count=len(skipped),
+    )
+    for item in skipped:
+        add_operation_log(
+            db,
+            operation_type="manual_validation",
+            outcome="skipped",
+            task_id=task.id,
+            account_id=item["id"],
+            message=item["reason"],
+        )
+
+    if accepted_ids:
+        add_operation_log(
+            db,
+            operation_type="manual_validation",
+            outcome="queued",
+            task_id=task.id,
+            message="批量验活任务已排队",
+            details={"total": len(account_ids), "accepted": len(accepted_ids), "skipped": len(skipped)},
+        )
+    else:
+        complete_operation_task(task, request.app.state.settings)
+        add_operation_log(
+            db,
+            operation_type="manual_validation",
+            outcome="completed",
+            task_id=task.id,
+            message="没有可验活的账号",
+        )
+    db.commit()
+    if accepted_ids:
+        background_tasks.add_task(
+            _validate_accounts_task,
+            request.app.state.session_factory,
+            request.app.state.validator,
+            request.app.state.settings,
+            task.id,
+            accepted_ids,
+        )
+    return JSONResponse(
+        content={"accepted": len(accepted_ids), "skipped": skipped},
+        headers={"X-Operation-Task-ID": task.id},
+    )
 
 
 @router.post("/cdks/generate", dependencies=[Depends(require_admin)])
