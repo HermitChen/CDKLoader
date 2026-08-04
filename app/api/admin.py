@@ -185,14 +185,15 @@ def get_operation_task(task_id: str, db: Session = Depends(get_db)):
     task = db.get(OperationTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="操作任务不存在")
-    logs = db.scalars(
-        select(OperationLog)
+    logs = db.execute(
+        select(OperationLog, Account.email)
+        .outerjoin(Account, Account.id == OperationLog.account_id)
         .where(OperationLog.task_id == task_id)
         .order_by(OperationLog.created_at.desc())
         .limit(100)
     ).all()
     payload = serialize_operation_task(task)
-    payload["logs"] = [serialize_operation_log(item) for item in logs]
+    payload["logs"] = [serialize_operation_log(log, account_email=email) for log, email in logs]
     return payload
 
 

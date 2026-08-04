@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   Archive,
   ChevronLeft,
@@ -65,7 +65,19 @@ const operationTaskPageSize = ref(15)
 const operationLogPageSize = ref(30)
 const operationTaskFilters = ref({ task_type: '', status: '' })
 const operationLogFilters = ref({ q: '', operation_type: '', outcome: '' })
+const operationTaskDetail = ref(null)
+const operationTaskDetailOpen = ref(false)
+const operationTaskDetailLoading = ref(false)
+const operationTaskDetailError = ref('')
 let adminTaskPollTimer = null
+let adminTaskMessageTimer = null
+let adminTaskRefreshBusy = false
+let operationViewPollTimer = null
+let operationViewRefreshBusy = false
+let operationTaskDetailPollTimer = null
+let operationTaskDetailRefreshBusy = false
+let operationTaskDetailId = ''
+let operationTaskDetailAbortController = null
 const pageSizeOptions = [
   { label: '15 / 页', value: 15 }, { label: '30 / 页', value: 30 },
   { label: '50 / 页', value: 50 }, { label: '100 / 页', value: 100 },
@@ -373,7 +385,25 @@ function stopAdminTaskPolling() {
   }
 }
 
+function clearAdminTaskMessageTimer() {
+  if (adminTaskMessageTimer) {
+    window.clearTimeout(adminTaskMessageTimer)
+    adminTaskMessageTimer = null
+  }
+}
+
+function scheduleAdminTaskMessageClear() {
+  clearAdminTaskMessageTimer()
+  adminTaskMessageTimer = window.setTimeout(() => {
+    accountMessage.value = ''
+    accountValidationTask.value = null
+    adminTaskMessageTimer = null
+  }, 5000)
+}
+
 async function refreshAdminTask(taskId) {
+  if (!taskId || adminTaskRefreshBusy) return
+  adminTaskRefreshBusy = true
   try {
     const task = await adminRequest(`/admin/operation-tasks/${taskId}`)
     accountValidationTask.value = task
@@ -382,6 +412,7 @@ async function refreshAdminTask(taskId) {
       accountMessage.value = task.status === 'completed'
         ? `验活完成：${task.processed}/${task.total}，有效 ${task.valid_count}，无效 ${task.invalid_count}，待确认 ${task.inconclusive_count}。`
         : `验活任务失败：${task.error_message || '请查看任务日志。'}`
+      scheduleAdminTaskMessageClear()
       await Promise.all([loadAccounts(), loadOperationTasks(), loadOperationLogs()])
     } else {
       accountMessage.value = `验活进行中：${task.processed}/${task.total}（${task.percent}%）`
@@ -389,11 +420,14 @@ async function refreshAdminTask(taskId) {
   } catch (error) {
     stopAdminTaskPolling()
     pushToast('error', '读取验活进度失败', error.message)
+  } finally {
+    adminTaskRefreshBusy = false
   }
 }
 
 function trackAdminTask(taskId) {
   stopAdminTaskPolling()
+  clearAdminTaskMessageTimer()
   if (!taskId) return
   refreshAdminTask(taskId)
   adminTaskPollTimer = window.setInterval(() => refreshAdminTask(taskId), 900)
@@ -407,6 +441,7 @@ async function validateSelectedAccounts() {
   const ids = [...selectedAccountIds.value]
   if (!ids.length || accountValidationBusy.value) return
   accountValidationBusy.value = true
+  clearAdminTaskMessageTimer()
   accountMessage.value = ''
   try {
     const { payload: result, response } = await adminRequestWithMeta('/admin/accounts/validate', {
@@ -522,6 +557,99 @@ async function loadOperationLogs() {
     operationLogPage.value = pageCount(operationLogTotal.value, operationLogPageSize.value)
     return loadOperationLogs()
   }
+}
+
+function stopOperationViewPolling() {
+  if (operationViewPollTimer) {
+    window.clearInterval(operationViewPollTimer)
+    operationViewPollTimer = null
+  }
+}
+
+async function refreshOperationView() {
+  if (activeView.value !== 'logs' || operationViewRefreshBusy) return
+  operationViewRefreshBusy = true
+  try {
+    await Promise.all([loadOperationTasks(), loadOperationLogs()])
+  } catch (error) {
+    if (error instanceof ApiError && /认证/.test(error.message)) logout()
+  } finally {
+    operationViewRefreshBusy = false
+  }
+}
+
+function syncOperationViewPolling(view) {
+  stopOperationViewPolling()
+  if (view !== 'logs') return
+  refreshOperationView()
+  operationViewPollTimer = window.setInterval(refreshOperationView, 1500)
+}
+
+function stopOperationTaskDetailPolling({ cancelRequest = true } = {}) {
+  if (operationTaskDetailPollTimer) {
+    window.clearInterval(operationTaskDetailPollTimer)
+    operationTaskDetailPollTimer = null
+  }
+  if (cancelRequest) {
+    operationTaskDetailAbortController?.abort()
+    operationTaskDetailAbortController = null
+    operationTaskDetailRefreshBusy = false
+  }
+}
+
+async function refreshOperationTaskDetail(taskId, { silent = false } = {}) {
+  if (!taskId || operationTaskDetailRefreshBusy) return
+  operationTaskDetailRefreshBusy = true
+  if (!silent) {
+    operationTaskDetailLoading.value = true
+    operationTaskDetailError.value = ''
+  }
+  const abortController = new AbortController()
+  operationTaskDetailAbortController = abortController
+  try {
+    const detail = await adminRequest(`/admin/operation-tasks/${taskId}`, { signal: abortController.signal })
+    if (operationTaskDetailId !== taskId) return
+    operationTaskDetail.value = detail
+    operationTaskDetailError.value = ''
+    if (detail.status === 'completed' || detail.status === 'failed') stopOperationTaskDetailPolling({ cancelRequest: false })
+  } catch (error) {
+    if (!silent && error.name !== 'AbortError' && operationTaskDetailId === taskId) operationTaskDetailError.value = error.message
+  } finally {
+    if (operationTaskDetailAbortController === abortController) {
+      operationTaskDetailAbortController = null
+      if (!silent) operationTaskDetailLoading.value = false
+      operationTaskDetailRefreshBusy = false
+    }
+  }
+}
+
+function trackOperationTaskDetail(taskId) {
+  stopOperationTaskDetailPolling()
+  if (!taskId) return
+  operationTaskDetailPollTimer = window.setInterval(() => {
+    refreshOperationTaskDetail(taskId, { silent: true })
+  }, 900)
+}
+
+async function openOperationTask(task) {
+  stopOperationTaskDetailPolling()
+  operationTaskDetailOpen.value = true
+  operationTaskDetailId = task.id
+  operationTaskDetail.value = null
+  operationTaskDetailError.value = ''
+  await refreshOperationTaskDetail(task.id)
+  if (operationTaskDetail.value?.status === 'queued' || operationTaskDetail.value?.status === 'running') {
+    trackOperationTaskDetail(task.id)
+  }
+}
+
+function closeOperationTaskDetail() {
+  stopOperationTaskDetailPolling()
+  operationTaskDetailOpen.value = false
+  operationTaskDetailId = ''
+  operationTaskDetail.value = null
+  operationTaskDetailLoading.value = false
+  operationTaskDetailError.value = ''
 }
 
 function changeAccountPage(delta) {
@@ -651,6 +779,8 @@ function openCdkForAccount(account) {
   cdkPage.value = 1
   loadCdks({ clearSelection: true })
 }
+
+watch(activeView, syncOperationViewPolling)
 
 function updateSelection(selected, id, checked) {
   if (checked && !selected.value.includes(id)) selected.value = [...selected.value, id]
@@ -1127,6 +1257,9 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopAdminTaskPolling()
+  clearAdminTaskMessageTimer()
+  stopOperationViewPolling()
+  stopOperationTaskDetailPolling()
   closeExportStream()
 })
 </script>
@@ -1240,11 +1373,24 @@ onUnmounted(() => {
       </section>
 
       <section v-if="activeView === 'logs'" class="workspace-section logs-view">
-        <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>任务</span><strong>{{ operationTaskTotal }}</strong><span>条</span></div><RefreshCw :size="15" class="task-refresh-icon" /><span v-if="accountValidationTask?.status === 'running'" class="task-live-label">验活任务实时更新</span></div></template>
-          <template #end><div class="filter-group"><FilterSelect v-model="operationTaskFilters.task_type" :options="[{ label: '全部任务', value: '' }, { label: '手动验活', value: 'manual_validation' }, { label: '导入预验活', value: 'account_import_validation' }, { label: '兑换导出', value: 'redemption_export' }, { label: '补发导出', value: 'redelivery_export' } ]" size="sm" aria-label="任务类型筛选" @update:model-value="filterOperationTasks" /><FilterSelect v-model="operationTaskFilters.status" :options="[{ label: '全部状态', value: '' }, { label: '排队中', value: 'queued' }, { label: '处理中', value: 'running' }, { label: '已完成', value: 'completed' }, { label: '失败', value: 'failed' } ]" size="sm" aria-label="任务状态筛选" @update:model-value="filterOperationTasks" /></div></template>
-        </ToolbarShell>
-        <TableShell class="data-table operation-tasks-table" :show-empty="!operationTasks.length" :empty-colspan="6" empty-title="暂无操作任务" empty-description="验活或导出后会显示任务进度。" variant="soft" size="sm"><template #head><tr><th>任务</th><th>类型</th><th>进度</th><th>结果</th><th>创建时间（东八区）</th><th>状态</th></tr></template><tr v-for="task in operationTasks" :key="task.id"><td><b>{{ task.id.slice(0, 8) }}</b><small>{{ task.resource_id ? `资源 ${task.resource_id.slice(0, 8)}` : '—' }}</small></td><td>{{ taskTypeLabel(task.task_type) }}</td><td><div class="task-progress"><div class="progress-track"><span :style="{ width: `${task.percent}%` }" /></div><small>{{ task.processed }} / {{ task.total }}（{{ task.percent }}%）</small></div></td><td><span class="task-result-counts">有效 {{ task.valid_count }} · 无效 {{ task.invalid_count }} · 待确认 {{ task.inconclusive_count }} · 跳过 {{ task.skipped_count }}</span></td><td>{{ formatDate(task.created_at) }}</td><td><StatusPill :label="statusLabel(task.status)" :tone="statusTone(task.status)" size="xs" radius="rounded" /></td></tr></TableShell>
+        <div class="logs-task-subsection">
+          <ToolbarShell class="list-toolbar" stack-on-mobile>
+            <template #start><div class="selection-actions"><div class="list-summary"><span>任务</span><strong>{{ operationTaskTotal }}</strong><span>条</span></div><RefreshCw :size="15" class="task-refresh-icon" /><span v-if="accountValidationTask?.status === 'running'" class="task-live-label">验活任务实时更新</span></div></template>
+            <template #end><div class="filter-group"><FilterSelect v-model="operationTaskFilters.task_type" :options="[{ label: '全部任务', value: '' }, { label: '手动验活', value: 'manual_validation' }, { label: '导入预验活', value: 'account_import_validation' }, { label: '兑换导出', value: 'redemption_export' }, { label: '补发导出', value: 'redelivery_export' } ]" size="sm" aria-label="任务类型筛选" @update:model-value="filterOperationTasks" /><FilterSelect v-model="operationTaskFilters.status" :options="[{ label: '全部状态', value: '' }, { label: '排队中', value: 'queued' }, { label: '处理中', value: 'running' }, { label: '已完成', value: 'completed' }, { label: '失败', value: 'failed' } ]" size="sm" aria-label="任务状态筛选" @update:model-value="filterOperationTasks" /></div></template>
+          </ToolbarShell>
+          <TableShell class="data-table operation-tasks-table" :show-empty="!operationTasks.length" :empty-colspan="6" empty-title="暂无操作任务" empty-description="验活或导出后会显示任务进度。" variant="soft" size="sm">
+            <template #head><tr><th>任务</th><th>类型</th><th>进度</th><th>结果</th><th>创建时间（东八区）</th><th>状态</th></tr></template>
+            <tr v-for="task in operationTasks" :key="task.id" class="task-row">
+              <td><button class="task-detail-link" type="button" title="查看任务详情" @click="openOperationTask(task)"><b>{{ task.id.slice(0, 8) }}</b><small>{{ task.resource_id ? `资源 ${task.resource_id.slice(0, 8)}` : '—' }}</small></button></td>
+              <td>{{ taskTypeLabel(task.task_type) }}</td>
+              <td><div class="task-progress"><div class="progress-track"><span :style="{ width: `${task.percent}%` }" /></div><small>{{ task.processed }} / {{ task.total }}（{{ task.percent }}%）</small></div></td>
+              <td><span class="task-result-counts">有效 {{ task.valid_count }} · 无效 {{ task.invalid_count }} · 待确认 {{ task.inconclusive_count }} · 跳过 {{ task.skipped_count }}</span></td>
+              <td>{{ formatDate(task.created_at) }}</td>
+              <td><StatusPill :label="statusLabel(task.status)" :tone="statusTone(task.status)" size="xs" radius="rounded" /></td>
+            </tr>
+          </TableShell>
+          <div v-if="operationTaskTotal" class="pagination-bar" aria-label="操作任务分页"><span>{{ pageRange(operationTaskTotal, operationTaskPage, operationTaskPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="operationTaskPageSize" :options="pageSizeOptions" size="sm" aria-label="操作任务每页条数" @update:model-value="changeOperationTaskPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="operationTaskPage <= 1" @click="changeOperationTaskPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ operationTaskPage }} / {{ pageCount(operationTaskTotal, operationTaskPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="operationTaskPage >= pageCount(operationTaskTotal, operationTaskPageSize)" @click="changeOperationTaskPage(1)"><ChevronRight :size="15" /></NButton></div></div>
+        </div>
         <div class="logs-subsection">
           <ToolbarShell class="list-toolbar" stack-on-mobile>
             <template #start><div class="selection-actions"><div class="list-summary"><span>日志</span><strong>{{ operationLogTotal }}</strong><span>条</span></div></div></template>
@@ -1253,10 +1399,33 @@ onUnmounted(() => {
           <TableShell class="data-table operation-logs-table" :show-empty="!operationLogs.length" :empty-colspan="5" empty-title="暂无操作日志" empty-description="当前筛选没有匹配记录。" variant="soft" size="sm"><template #head><tr><th>时间（东八区）</th><th>操作</th><th>账号</th><th>结果</th><th>消息</th></tr></template><tr v-for="log in operationLogs" :key="log.id"><td>{{ formatDate(log.created_at) }}</td><td><b>{{ taskTypeLabel(log.operation_type) }}</b><small>{{ log.task_id ? `任务 ${log.task_id.slice(0, 8)}` : (log.resource_id ? `资源 ${log.resource_id.slice(0, 8)}` : '—') }}</small></td><td><b>{{ log.account_email || '—' }}</b><small>{{ log.account_id || '—' }}</small></td><td><StatusPill :label="outcomeLabel(log.outcome)" :tone="statusTone(log.outcome)" size="xs" radius="rounded" /></td><td><span class="log-message" :title="log.message">{{ log.message || '—' }}</span></td></tr></TableShell>
           <div v-if="operationLogTotal" class="pagination-bar" aria-label="操作日志分页"><span>{{ pageRange(operationLogTotal, operationLogPage, operationLogPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="operationLogPageSize" :options="pageSizeOptions" size="sm" aria-label="操作日志每页条数" @update:model-value="changeOperationLogPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="operationLogPage <= 1" @click="changeOperationLogPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ operationLogPage }} / {{ pageCount(operationLogTotal, operationLogPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="operationLogPage >= pageCount(operationLogTotal, operationLogPageSize)" @click="changeOperationLogPage(1)"><ChevronRight :size="15" /></NButton></div></div>
         </div>
-        <div v-if="operationTaskTotal" class="pagination-bar" aria-label="操作任务分页"><span>{{ pageRange(operationTaskTotal, operationTaskPage, operationTaskPageSize) }}</span><div class="pagination-controls"><FilterSelect class="page-size-select" v-model="operationTaskPageSize" :options="pageSizeOptions" size="sm" aria-label="操作任务每页条数" @update:model-value="changeOperationTaskPageSize" /><NButton type="button" variant="outline" size="xs" icon-only title="上一页" :disabled="operationTaskPage <= 1" @click="changeOperationTaskPage(-1)"><ChevronLeft :size="15" /></NButton><strong>{{ operationTaskPage }} / {{ pageCount(operationTaskTotal, operationTaskPageSize) }}</strong><NButton type="button" variant="outline" size="xs" icon-only title="下一页" :disabled="operationTaskPage >= pageCount(operationTaskTotal, operationTaskPageSize)" @click="changeOperationTaskPage(1)"><ChevronRight :size="15" /></NButton></div></div>
       </section>
     </main>
   </div>
+
+  <ModalShell :open="operationTaskDetailOpen" title="任务详情" :description="operationTaskDetail ? `${taskTypeLabel(operationTaskDetail.task_type)} · 任务 ${operationTaskDetail.id.slice(0, 8)}` : '读取任务详情'" max-width="980px" @close="closeOperationTaskDetail">
+    <div v-if="operationTaskDetail" class="operation-task-detail">
+      <div class="task-detail-overview">
+        <div class="task-detail-status"><span>状态</span><StatusPill :label="statusLabel(operationTaskDetail.status)" :tone="statusTone(operationTaskDetail.status)" size="xs" radius="rounded" /></div>
+        <div><span>处理进度</span><strong>{{ operationTaskDetail.processed }} / {{ operationTaskDetail.total }}（{{ operationTaskDetail.percent }}%）</strong></div>
+        <div><span>创建时间</span><strong>{{ formatDate(operationTaskDetail.created_at) }}</strong></div>
+        <div><span>完成时间</span><strong>{{ formatDate(operationTaskDetail.completed_at) }}</strong></div>
+      </div>
+      <div class="task-detail-progress">
+        <div class="progress-track"><span :style="{ width: `${operationTaskDetail.percent}%` }" /></div>
+        <div class="task-detail-counts"><span>有效 <b>{{ operationTaskDetail.valid_count }}</b></span><span>无效 <b>{{ operationTaskDetail.invalid_count }}</b></span><span>待确认 <b>{{ operationTaskDetail.inconclusive_count }}</b></span><span>跳过 <b>{{ operationTaskDetail.skipped_count }}</b></span><span>失败 <b>{{ operationTaskDetail.failed_count }}</b></span></div>
+      </div>
+      <CalloutBox v-if="operationTaskDetail.error_message" tone="error" variant="soft" size="sm">{{ operationTaskDetail.error_message }}</CalloutBox>
+      <CalloutBox v-if="operationTaskDetailError" tone="error" variant="soft" size="sm">{{ operationTaskDetailError }}</CalloutBox>
+      <div class="task-detail-log-section">
+        <div class="task-detail-section-heading"><div><b>执行记录</b><span>按时间倒序显示最近 100 条</span></div><LoaderCircle v-if="operationTaskDetailLoading" :size="15" class="spin" /></div>
+        <TableShell class="data-table operation-detail-logs" :show-empty="!operationTaskDetail.logs?.length" :empty-colspan="4" empty-title="暂无执行记录" empty-description="任务开始后会显示逐条结果。" variant="soft" size="sm"><template #head><tr><th>时间（东八区）</th><th>账号</th><th>结果</th><th>消息</th></tr></template><tr v-for="log in operationTaskDetail.logs" :key="log.id"><td>{{ formatDate(log.created_at) }}</td><td><b>{{ log.account_email || '—' }}</b><small>{{ log.account_id || '—' }}</small></td><td><StatusPill :label="outcomeLabel(log.outcome)" :tone="statusTone(log.outcome)" size="xs" radius="rounded" /></td><td><span class="task-detail-message">{{ log.message || '—' }}</span></td></tr></TableShell>
+      </div>
+    </div>
+    <CalloutBox v-else-if="operationTaskDetailLoading" tone="info" variant="soft" size="sm"><LoaderCircle :size="15" class="spin" />正在读取任务详情...</CalloutBox>
+    <CalloutBox v-else tone="error" variant="soft" size="sm">{{ operationTaskDetailError || '任务详情暂时不可用。' }}</CalloutBox>
+    <template #footer><NButton type="button" variant="outline" size="sm" @click="closeOperationTaskDetail">关闭</NButton></template>
+  </ModalShell>
 
   <ModalShell :open="accountImportOpen" title="导入账号" description="上传账号文件，预览无误后写入账号池。" max-width="880px" @close="accountImportOpen = false">
     <div class="import-dialog-body">

@@ -50,6 +50,10 @@ def test_manual_validation_exposes_progress_task_without_changing_response_body(
     assert task.json()["status"] == "completed"
     assert task.json()["processed"] == 2
     assert task.json()["valid_count"] == 2
+    assert {item["account_email"] for item in task.json()["logs"] if item["account_email"]} == {
+        "task-user-0@example.com",
+        "task-user-1@example.com",
+    }
 
     logs = client.get(
         "/api/v1/admin/operation-logs",
