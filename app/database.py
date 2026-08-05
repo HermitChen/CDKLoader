@@ -45,12 +45,23 @@ def apply_compatibility_migrations(engine: Engine) -> None:
     inspector = inspect(engine)
     cdk_columns = {column["name"] for column in inspector.get_columns("cdks")}
     account_columns = {column["name"] for column in inspector.get_columns("accounts")}
-    if "code_encrypted" not in cdk_columns or "proxy_used" not in account_columns:
+    redemption_columns = {column["name"] for column in inspector.get_columns("redemptions")}
+    redelivery_columns = {column["name"] for column in inspector.get_columns("redeliveries")}
+    if (
+        "code_encrypted" not in cdk_columns
+        or "proxy_used" not in account_columns
+        or "export_file_name" not in redemption_columns
+        or "export_file_name" not in redelivery_columns
+    ):
         with engine.begin() as connection:
             if "code_encrypted" not in cdk_columns:
                 connection.execute(text("ALTER TABLE cdks ADD COLUMN code_encrypted TEXT"))
             if "proxy_used" not in account_columns:
                 connection.execute(text("ALTER TABLE accounts ADD COLUMN proxy_used VARCHAR(1024)"))
+            if "export_file_name" not in redemption_columns:
+                connection.execute(text("ALTER TABLE redemptions ADD COLUMN export_file_name VARCHAR(255)"))
+            if "export_file_name" not in redelivery_columns:
+                connection.execute(text("ALTER TABLE redeliveries ADD COLUMN export_file_name VARCHAR(255)"))
 
 
 def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:

@@ -191,6 +191,7 @@ class Redemption(Base):
     error_code: Mapped[str] = mapped_column(String(64), default="")
     error_message: Mapped[str] = mapped_column(String(500), default="")
     downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    export_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -231,6 +232,7 @@ class Redelivery(Base):
     recovery_expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    export_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     items: Mapped[list["RedeliveryItem"]] = relationship(
         back_populates="redelivery", cascade="all, delete-orphan", order_by="RedeliveryItem.ordinal"

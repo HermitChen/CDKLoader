@@ -463,6 +463,7 @@ def serialize_redemption(
         "created_at": to_china_iso(redemption.created_at),
         "completed_at": to_china_iso(redemption.completed_at),
         "downloaded_at": to_china_iso(redemption.downloaded_at),
+        "export_file_name": redemption.export_file_name,
         "cdks": [
             {
                 "id": relation.cdk.id,
@@ -501,6 +502,7 @@ def serialize_redelivery(redelivery: Redelivery, security: SecurityManager) -> d
         "created_at": to_china_iso(redelivery.created_at),
         "completed_at": to_china_iso(redelivery.created_at),
         "downloaded_at": to_china_iso(redelivery.downloaded_at),
+        "export_file_name": redelivery.export_file_name,
         "recovery_expires_at": to_china_iso(redelivery.recovery_expires_at),
         "cdks": list(cdks_by_id.values()),
         "task_token": security.redelivery_token(redelivery.id, redelivery.idempotency_key),

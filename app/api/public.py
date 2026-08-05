@@ -16,14 +16,14 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from ..dependencies import get_db
 from ..models import OperationTask, Redelivery, Redemption, RedemptionCDK, utcnow
 from ..schemas import RedemptionCreateRequest
-from ..services.exporter import build_download, build_redelivery_download
+from ..services.exporter import export_media_type, persist_redelivery_download, persist_redemption_download
 from ..services.operations import add_operation_log, create_operation_task, export_directory, serialize_operation_task
 from ..services.redemption import RedemptionError, RedemptionService, serialize_redelivery, serialize_redemption
 
@@ -325,7 +325,7 @@ def _export_download_response(
     db.commit()
     return FileResponse(
         artifact,
-        media_type="application/zip",
+        media_type=export_media_type(task.file_name),
         filename=task.file_name,
         headers={
             "Cache-Control": "private, max-age=0, no-store",
@@ -565,16 +565,21 @@ def download_redemption(
     if redemption.downloaded_at:
         raise HTTPException(status_code=410, detail="下载链接已使用")
     try:
-        content, filename, media_type = build_download(db, redemption_id, request.app.state.security)
+        stored_artifact = persist_redemption_download(
+            db,
+            redemption_id,
+            request.app.state.security,
+            export_directory(request.app.state.settings),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     redemption.downloaded_at = utcnow()
     db.commit()
-    return Response(
-        content=content,
-        media_type=media_type,
+    return FileResponse(
+        stored_artifact.path,
+        media_type=stored_artifact.media_type,
+        filename=stored_artifact.path.name,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-store, private",
             "X-Content-Type-Options": "nosniff",
         },
@@ -705,7 +710,12 @@ def download_redelivery(
     if redelivery.status != "ready":
         raise HTTPException(status_code=409, detail="关联账号已不可用，无法补发")
     try:
-        content, filename, media_type = build_redelivery_download(db, redelivery_id, request.app.state.security)
+        stored_artifact = persist_redelivery_download(
+            db,
+            redelivery_id,
+            request.app.state.security,
+            export_directory(request.app.state.settings),
+        )
     except ValueError as exc:
         redelivery.status = "unavailable"
         db.commit()
@@ -713,11 +723,11 @@ def download_redelivery(
     redelivery.status = "downloaded"
     redelivery.downloaded_at = utcnow()
     db.commit()
-    return Response(
-        content=content,
-        media_type=media_type,
+    return FileResponse(
+        stored_artifact.path,
+        media_type=stored_artifact.media_type,
+        filename=stored_artifact.path.name,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-store, private",
             "X-Content-Type-Options": "nosniff",
         },

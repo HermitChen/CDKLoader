@@ -133,20 +133,20 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 使用 JSON 格式的 CDK 兑换成功后，下载文件名类似：
 
 ```text
-accounts_20260801_153045.zip
+accounts_20260801_153045_<redemption-task-id>.zip
 ```
 
 压缩包结构：
 
 ```text
-accounts_20260801_153045.zip
+accounts_20260801_153045_<redemption-task-id>.zip
 ├── cpa/
 │   └── user@example.com.json
 └── sub2api/
     └── user@example.com_sub2api.json
 ```
 
-原始下载链接只能成功使用一次。若 CDK 已成功兑换，在 `REDELIVERY_WINDOW_SECONDS` 指定的窗口内再次提交同一 CDK，系统会直接补发该 CDK 首次关联的账号，不会重新验活、分配账号或扣减额度；每次补发仍使用新的单次下载链接。窗口结束后，公开页面不再支持补发，管理员可在账号池中按关联关系二次导出。已交付文件包含敏感凭据，请在受控环境中保存和传输。
+原始下载链接只能成功使用一次。若 CDK 已成功兑换，在 `REDELIVERY_WINDOW_SECONDS` 指定的窗口内再次提交同一 CDK，系统会直接复用首次兑换任务已经落盘的文件，不会重新打包、验活、分配账号或扣减额度；每次补发仍使用新的单次下载链接。窗口结束后，公开页面不再支持补发，管理员可在账号池中按关联关系二次导出。已交付文件包含敏感凭据，请在受控环境中保存和传输。
 
 ## 验活行为
 

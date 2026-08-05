@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import PROJECT_ROOT, Settings
-from ..models import OperationLog, OperationTask, utcnow
+from ..models import OperationLog, OperationTask, Redelivery, RedeliveryItem, Redemption, utcnow
 from ..time import to_china_iso
 
 
@@ -158,6 +158,50 @@ def _safe_artifact_path(directory: Path, file_name: str | None) -> Path | None:
     return candidate
 
 
+def _referenced_artifact_names(factory: sessionmaker[Session]) -> set[str]:
+    now = utcnow()
+    with factory() as session:
+        names = set(
+            name
+            for name in session.scalars(
+                select(Redemption.export_file_name)
+                .join(RedeliveryItem, RedeliveryItem.source_redemption_id == Redemption.id)
+                .join(Redelivery, Redelivery.id == RedeliveryItem.redelivery_id)
+                .where(
+                    Redelivery.recovery_expires_at > now,
+                    Redemption.export_file_name.is_not(None),
+                )
+                .distinct()
+            ).all()
+            if name
+        )
+        names.update(
+            name
+            for name in session.scalars(
+                select(Redelivery.export_file_name).where(
+                    Redelivery.recovery_expires_at > now,
+                    Redelivery.export_file_name.is_not(None),
+                )
+            ).all()
+            if name
+        )
+        names.update(
+            name
+            for name in session.scalars(
+                select(OperationTask.file_name).where(
+                    OperationTask.file_name.is_not(None),
+                    (
+                        OperationTask.expires_at.is_(None)
+                        | (OperationTask.expires_at > now)
+                        | OperationTask.status.in_({"queued", "running"})
+                    ),
+                )
+            ).all()
+            if name
+        )
+        return names
+
+
 def mark_interrupted_tasks(factory: sessionmaker[Session], settings: Settings) -> int:
     interrupted = 0
     with factory.begin() as session:
@@ -202,11 +246,44 @@ def cleanup_operation_data(
                 OperationTask.expires_at <= now,
             )
         ).all()
+        expired_task_ids = {task.id for task in expired_tasks}
         for task in expired_tasks:
             if artifact := _safe_artifact_path(directory, task.file_name):
                 artifact_paths.append(artifact)
             session.delete(task)
             deleted_tasks += 1
+        if artifact_paths:
+            candidate_names = {artifact.name for artifact in artifact_paths}
+            referenced_names = set(
+                name
+                for name in session.scalars(
+                    select(Redemption.export_file_name).where(
+                        Redemption.export_file_name.in_(candidate_names)
+                    )
+                ).all()
+                if name
+            )
+            referenced_names.update(
+                name
+                for name in session.scalars(
+                    select(Redelivery.export_file_name).where(
+                        Redelivery.export_file_name.in_(candidate_names)
+                    )
+                ).all()
+                if name
+            )
+            if expired_task_ids:
+                referenced_names.update(
+                    name
+                    for name in session.scalars(
+                        select(OperationTask.file_name).where(
+                            OperationTask.file_name.in_(candidate_names),
+                            ~OperationTask.id.in_(expired_task_ids),
+                        )
+                    ).all()
+                    if name
+                )
+            artifact_paths = [artifact for artifact in artifact_paths if artifact.name not in referenced_names]
 
     for artifact in artifact_paths:
         try:
@@ -214,10 +291,13 @@ def cleanup_operation_data(
         except OSError:
             logger.warning("unable to remove expired export artifact %s", artifact)
 
+    referenced_names = _referenced_artifact_names(factory)
     artifact_cutoff = datetime.now().timestamp() - max(300, settings.export_retention_seconds)
     try:
         for artifact in directory.iterdir():
-            if not artifact.is_file() or not (artifact.name.endswith(".zip") or artifact.name.endswith(".tmp")):
+            if not artifact.is_file() or artifact.suffix.lower() not in {".zip", ".tmp", ".csv", ".txt", ".json"}:
+                continue
+            if artifact.name in referenced_names:
                 continue
             try:
                 if artifact.stat().st_mtime < artifact_cutoff:

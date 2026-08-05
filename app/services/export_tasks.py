@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import logging
-import os
-from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import Settings
-from ..models import OperationTask, Redelivery, Redemption, utcnow
+from ..models import OperationTask, utcnow
 from ..security import SecurityManager
-from .exporter import build_delivery_archive_to_path, load_export_deliveries
+from .exporter import (
+    build_redelivery_archive_to_path,
+    build_redemption_archive_to_path,
+)
 from .operations import (
     add_operation_log,
     complete_operation_task,
@@ -73,49 +74,68 @@ class ExportTaskService:
 
         directory = export_directory(self.settings)
         temporary_path = directory / f".{task_id}.tmp"
-        display_name = f"accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{task_id[:8]}.zip"
-        final_path = directory / display_name
+        final_path: Path | None = None
+        total = 0
+        shared_artifact = False
+        source_redemption_id: str | None = None
         try:
             with self.factory() as session:
                 if task_type == "redemption_export":
-                    redemption = session.get(Redemption, resource_id) if resource_id else None
-                    if not redemption or redemption.status != "completed":
-                        raise ValueError("兑换任务尚未完成")
-                    deliveries = load_export_deliveries(session, redemption_id=resource_id)
+                    if not resource_id:
+                        raise ValueError("兑换任务不存在")
+                    shared_artifact = True
+                    final_path, total, _ = build_redemption_archive_to_path(
+                        session,
+                        resource_id,
+                        self.security,
+                        directory,
+                        temporary_path=temporary_path,
+                        on_progress=lambda processed, count: self._update_progress(task_id, processed, count),
+                    )
+                    session.commit()
                 elif task_type == "redelivery_export":
-                    redelivery = session.get(Redelivery, resource_id) if resource_id else None
-                    if not redelivery or redelivery.status not in {"ready", "downloaded"}:
+                    if not resource_id:
                         raise ValueError("补发任务当前不可导出")
-                    deliveries = load_export_deliveries(session, redelivery_id=resource_id)
+                    final_path, total, shared_artifact, source_redemption_id = build_redelivery_archive_to_path(
+                        session,
+                        resource_id,
+                        self.security,
+                        directory,
+                        temporary_path=temporary_path,
+                        on_progress=lambda processed, count: self._update_progress(task_id, processed, count),
+                    )
+                    session.commit()
                 else:
                     raise ValueError("不支持的导出任务类型")
 
-            build_delivery_archive_to_path(
-                deliveries,
-                self.security,
-                temporary_path,
-                on_progress=lambda processed, total: self._update_progress(task_id, processed, total),
-            )
-            os.replace(temporary_path, final_path)
+            if final_path is None:
+                raise ValueError("导出文件生成失败")
             with self.factory.begin() as session:
                 task = session.get(OperationTask, task_id)
                 if not task:
                     return
                 task.file_name = final_path.name
-                task.total = len(deliveries)
-                task.processed = len(deliveries)
+                task.total = total
+                task.processed = total
                 complete_operation_task(task, self.settings)
+                details = {"total": total, "file_name": final_path.name}
+                message = "导出任务已完成，可下载文件"
+                if source_redemption_id:
+                    details["source_redemption_id"] = source_redemption_id
+                    details["reused_source_artifact"] = True
+                    message = "补发导出已复用首次兑换文件"
                 add_operation_log(
                     session,
                     operation_type=task.task_type,
                     outcome="completed",
                     task_id=task.id,
                     resource_id=task.resource_id,
-                    message="导出任务已完成，可下载文件",
-                    details={"total": len(deliveries), "file_name": final_path.name},
+                    message=message,
+                    details=details,
                 )
         except Exception:
             temporary_path.unlink(missing_ok=True)
-            final_path.unlink(missing_ok=True)
+            if not shared_artifact and final_path is not None:
+                final_path.unlink(missing_ok=True)
             logger.exception("export task %s failed", task_id)
             self._task_error(task_id, "导出任务执行失败，请重新发起导出")

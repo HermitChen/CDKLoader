@@ -5,6 +5,7 @@ import json
 import re
 import zipfile
 from datetime import timedelta
+from pathlib import Path
 
 from app.models import Redelivery, Redemption, utcnow
 
@@ -166,7 +167,7 @@ def test_multi_cdk_redemption_delivers_zip_once(client, admin_headers):
     assert result.status_code == 200
     assert result.headers["content-type"].startswith("application/zip")
     assert re.fullmatch(
-        r'attachment; filename="accounts_\d{8}_\d{6}\.zip"',
+        r'attachment; filename="accounts_\d{8}_\d{6}_[0-9a-f-]{36}\.zip"',
         result.headers["content-disposition"],
     )
     with zipfile.ZipFile(io.BytesIO(result.content)) as archive:
@@ -302,7 +303,7 @@ def test_redeemed_cdk_redelivery_window_expiry_and_mixed_submission(client, admi
     assert detail["details"][0]["code"] == "redelivery_expired"
 
 
-def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_headers, settings):
+def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_headers, settings, monkeypatch):
     _import_accounts(client, admin_headers, count=1)
     code = _generate_cdks(client, admin_headers, count=1)[0]
     initial = client.post(
@@ -311,6 +312,28 @@ def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_head
         json={"codes": [code]},
     )
     assert initial.status_code == 200, initial.text
+    initial_body = initial.json()
+    initial_export_path = f"/api/v1/redemptions/{initial_body['id']}/export"
+    initial_started = client.post(initial_export_path, params={"token": initial_body["task_token"]})
+    assert initial_started.status_code in {200, 202}
+    initial_task = initial_started.json()
+    with client.websocket_connect(
+        f"{initial_export_path}/{initial_task['id']}/ws?token={initial_body['task_token']}"
+    ) as websocket:
+        for _ in range(50):
+            initial_current = websocket.receive_json()
+            if initial_current["status"] in {"completed", "failed"}:
+                break
+    assert initial_current["status"] == "completed"
+    initial_file_name = initial_current["file_name"]
+    initial_artifact = Path(settings.export_dir) / initial_file_name
+    assert initial_artifact.is_file()
+    initial_bytes = initial_artifact.read_bytes()
+
+    def fail_repack(*_args, **_kwargs):
+        raise AssertionError("补发不应重新打包首次兑换文件")
+
+    monkeypatch.setattr("app.services.exporter.build_delivery_archive_to_path", fail_repack)
 
     redelivery = client.post(
         "/api/v1/redemptions",
@@ -332,6 +355,8 @@ def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_head
             if current["status"] in {"completed", "failed"}:
                 break
     assert current["status"] == "completed"
+    assert current["file_name"] == initial_file_name
+    assert (Path(settings.export_dir) / current["file_name"]).read_bytes() == initial_bytes
 
     reused = client.post(export_path, params={"token": redelivery_body["task_token"]})
     assert reused.status_code == 200
@@ -343,6 +368,8 @@ def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_head
         params={"token": redelivery_body["task_token"]},
     )
     assert downloaded.status_code == 200
+    assert downloaded.headers["content-disposition"] == f'attachment; filename="{initial_file_name}"'
+    assert downloaded.content == initial_bytes
 
     with client.app.state.session_factory.begin() as session:
         redelivery_row = session.get(Redelivery, redelivery_body["id"])
@@ -356,6 +383,38 @@ def test_redelivery_export_reuses_archive_and_enforces_window(client, admin_head
     assert expired_download.status_code == 410
     expired_reuse = client.post(export_path, params={"token": redelivery_body["task_token"]})
     assert expired_reuse.status_code == 410
+
+
+def test_redelivery_direct_download_reuses_initial_archive(client, admin_headers):
+    _import_accounts(client, admin_headers, count=1)
+    code = _generate_cdks(client, admin_headers, count=1)[0]
+    initial = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "initial-direct-redelivery", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert initial.status_code == 200, initial.text
+    initial_body = initial.json()
+    initial_download = client.get(
+        f"/api/v1/redemptions/{initial_body['id']}/download",
+        params={"token": initial_body["task_token"]},
+    )
+    assert initial_download.status_code == 200
+
+    redelivery = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "direct-redelivery-request", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert redelivery.status_code == 200, redelivery.text
+    redelivery_body = redelivery.json()
+    redelivery_download = client.get(
+        f"/api/v1/redeliveries/{redelivery_body['id']}/download",
+        params={"token": redelivery_body["task_token"]},
+    )
+    assert redelivery_download.status_code == 200, redelivery_download.text
+    assert redelivery_download.headers["content-disposition"] == initial_download.headers["content-disposition"]
+    assert redelivery_download.content == initial_download.content
 
 
 def test_single_json_delivery_defaults_to_cpa_and_sub2api_zip(client, admin_headers):
