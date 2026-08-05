@@ -18,6 +18,8 @@ def settings(tmp_path: Path) -> Settings:
         credential_secret="test-credential-secret",
         cdk_pepper="test-cdk-pepper",
         validation_mode="structural",
+        validation_egress_mode="account",
+        validation_probe_mode="strict",
         validation_timeout_seconds=1,
         validation_attempts=1,
         validation_concurrency=2,

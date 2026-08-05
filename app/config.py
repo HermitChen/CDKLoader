@@ -92,6 +92,12 @@ class Settings:
     validation_retry_base_seconds: float = 1.0
     validation_retry_max_seconds: float = 30.0
     validation_retry_jitter_seconds: float = 0.25
+    validation_proxy_pool: str = ""
+    validation_egress_mode: str = "direct"
+    validation_probe_mode: str = "fast"
+    validation_cooldown_seconds: float = 60.0
+    validation_gate_threshold: int = 5
+    validation_impersonate: str = "chrome146"
 
     @property
     def is_sqlite(self) -> bool:
@@ -108,9 +114,9 @@ def get_settings() -> Settings:
         credential_secret=os.getenv("CREDENTIAL_SECRET", "development-credential-secret"),
         cdk_pepper=os.getenv("CDK_PEPPER", "development-cdk-pepper"),
         validation_mode=os.getenv("VALIDATION_MODE", "remote").strip().lower(),
-        validation_timeout_seconds=float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "5")),
+        validation_timeout_seconds=float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "30")),
         validation_attempts=max(1, int(os.getenv("VALIDATION_ATTEMPTS", "3"))),
-        validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "6"))),
+        validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "2"))),
         redelivery_window_seconds=max(0, int(os.getenv("REDELIVERY_WINDOW_SECONDS", "1800"))),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:1456").rstrip("/"),
         max_upload_bytes=parse_size_bytes(os.getenv("MAX_UPLOAD_BYTES", "100M")),
@@ -126,12 +132,22 @@ def get_settings() -> Settings:
         export_dir=os.getenv("EXPORT_DIR", str(PROJECT_ROOT / "data" / "exports")),
         validation_proxy=os.getenv("VALIDATION_PROXY", "").strip(),
         validation_retry_base_seconds=max(
-            0.0, float(os.getenv("VALIDATION_RETRY_BASE_SECONDS", "1"))
+            0.0, float(os.getenv("VALIDATION_RETRY_BASE_SECONDS", "2"))
         ),
         validation_retry_max_seconds=max(
             0.0, float(os.getenv("VALIDATION_RETRY_MAX_SECONDS", "30"))
         ),
         validation_retry_jitter_seconds=max(
-            0.0, float(os.getenv("VALIDATION_RETRY_JITTER_SECONDS", "0.25"))
+            0.0, float(os.getenv("VALIDATION_RETRY_JITTER_SECONDS", "0.5"))
         ),
+        validation_proxy_pool=os.getenv("VALIDATION_PROXY_POOL", "").strip(),
+        validation_egress_mode=os.getenv("VALIDATION_EGRESS_MODE", "direct").strip().lower(),
+        validation_probe_mode=os.getenv("VALIDATION_PROBE_MODE", "fast").strip().lower(),
+        validation_cooldown_seconds=max(
+            0.0, float(os.getenv("VALIDATION_COOLDOWN_SECONDS", "60"))
+        ),
+        validation_gate_threshold=max(
+            1, int(os.getenv("VALIDATION_GATE_THRESHOLD", "5"))
+        ),
+        validation_impersonate=os.getenv("VALIDATION_IMPERSONATE", "chrome146").strip() or "chrome146",
     )

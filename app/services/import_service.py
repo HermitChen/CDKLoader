@@ -14,7 +14,7 @@ from ..security import SecurityManager, mask_email, token_hint
 from ..time import to_china_iso
 from .importers import ParseError, ParsedAccount, ParsedBatch
 from .operations import add_operation_log, complete_operation_task, start_operation_task
-from .validator import TokenValidator, apply_validation
+from .validator import TokenValidator, apply_validation, validation_result_details
 
 
 @dataclass
@@ -119,6 +119,7 @@ class AccountImportService:
         apply("client_id", record.client_id)
         apply("source", record.source)
         apply("registration_mode", record.registration_mode)
+        apply("proxy_used", record.proxy_used)
         apply("password", record.password, encrypted=True)
         apply("access_token", record.access_token, encrypted=True)
         apply("refresh_token", record.refresh_token, encrypted=True)
@@ -290,11 +291,7 @@ class AccountImportService:
                             resource_id=import_id,
                             account_id=account.id,
                             message=result.message or f"验活结果：{result.outcome}",
-                            details={
-                                "error_type": result.error_type,
-                                "validated_via": result.validated_via,
-                                "latency_ms": result.latency_ms,
-                            },
+                            details=validation_result_details(result),
                         )
             except Exception:
                 if not task_id:

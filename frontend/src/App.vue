@@ -296,18 +296,21 @@ function logout() {
 async function loadAdminData() {
   if (!adminToken.value) return
   try {
-    const [dashboardResult] = await Promise.all([
-      adminRequest('/admin/dashboard'),
+    await Promise.all([
+      loadDashboard(),
       loadAccounts(),
       loadCdks(),
       loadRedemptions(),
       loadOperationTasks(),
       loadOperationLogs(),
     ])
-    dashboard.value = dashboardResult
   } catch (error) {
     if (error instanceof ApiError && /认证/.test(error.message)) logout()
   }
+}
+
+async function loadDashboard() {
+  dashboard.value = await adminRequest('/admin/dashboard')
 }
 
 function normalizedPageSize(value) {
@@ -559,6 +562,28 @@ async function loadOperationLogs() {
   }
 }
 
+async function loadActiveView(view = activeView.value) {
+  if (view === 'overview') return loadDashboard()
+  if (view === 'accounts') return loadAccounts()
+  if (view === 'cdks') return loadCdks()
+  if (view === 'redemptions') return loadRedemptions()
+  if (view === 'logs') return Promise.all([loadOperationTasks(), loadOperationLogs()])
+  return null
+}
+
+async function refreshActiveView(view = activeView.value) {
+  if (!adminToken.value) return
+  try {
+    await loadActiveView(view)
+  } catch (error) {
+    if (error instanceof ApiError && /认证/.test(error.message)) {
+      logout()
+    } else {
+      pushToast('error', '刷新页面数据失败', error.message)
+    }
+  }
+}
+
 function stopOperationViewPolling() {
   if (operationViewPollTimer) {
     window.clearInterval(operationViewPollTimer)
@@ -570,7 +595,7 @@ async function refreshOperationView() {
   if (activeView.value !== 'logs' || operationViewRefreshBusy) return
   operationViewRefreshBusy = true
   try {
-    await Promise.all([loadOperationTasks(), loadOperationLogs()])
+    await loadActiveView('logs')
   } catch (error) {
     if (error instanceof ApiError && /认证/.test(error.message)) logout()
   } finally {
@@ -580,9 +605,12 @@ async function refreshOperationView() {
 
 function syncOperationViewPolling(view) {
   stopOperationViewPolling()
-  if (view !== 'logs') return
-  refreshOperationView()
-  operationViewPollTimer = window.setInterval(refreshOperationView, 1500)
+  if (view === 'logs') {
+    refreshOperationView()
+    operationViewPollTimer = window.setInterval(refreshOperationView, 1500)
+    return
+  }
+  refreshActiveView(view)
 }
 
 function stopOperationTaskDetailPolling({ cancelRequest = true } = {}) {
@@ -726,7 +754,7 @@ function openTodayRedemptions() {
   activeView.value = 'redemptions'
   redemptionFilters.value.today = true
   redemptionPage.value = 1
-  loadRedemptions({ clearSelection: true })
+  selectedRedemptionIds.value = []
 }
 
 function clearTodayRedemptionFilter() {
@@ -746,7 +774,7 @@ function openAccountsForCdk(cdk) {
     relation_label: `CDK：${cdkLabel(cdk)}`,
   }
   accountPage.value = 1
-  loadAccounts({ clearSelection: true })
+  selectedAccountIds.value = []
 }
 
 function openAccountsForRedemption(redemption) {
@@ -760,7 +788,7 @@ function openAccountsForRedemption(redemption) {
     relation_label: `兑换任务：${redemption.id.slice(0, 8)}`,
   }
   accountPage.value = 1
-  loadAccounts({ clearSelection: true })
+  selectedAccountIds.value = []
 }
 
 function clearAccountRelationFilter() {
@@ -777,7 +805,7 @@ function openCdkForAccount(account) {
   activeView.value = 'cdks'
   cdkFilters.value = { q: cdk.code || cdk.prefix, quota: '', status: '' }
   cdkPage.value = 1
-  loadCdks({ clearSelection: true })
+  selectedCdkIds.value = []
 }
 
 watch(activeView, syncOperationViewPolling)

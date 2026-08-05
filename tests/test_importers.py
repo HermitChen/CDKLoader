@@ -70,3 +70,20 @@ def test_invalid_txt_does_not_echo_token(settings):
     assert batch.errors[0].error_type == "invalid_txt"
     assert "only-two-fields" not in batch.errors[0].message
 
+
+def test_cpa_proxy_url_is_stored_as_account_proxy(settings):
+    batch = parse_import_file(
+        "account.json",
+        json.dumps(
+            {
+                "type": "web",
+                "email": "person@example.com",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "proxy_url": "http://account-proxy.example:8080",
+            }
+        ).encode(),
+        settings,
+    )
+
+    assert batch.records[0].proxy_used == "http://account-proxy.example:8080"

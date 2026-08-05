@@ -99,13 +99,19 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 | `CREDENTIAL_SECRET` | 开发占位值 | 账号凭据加密密钥，修改后无法解密已有数据 |
 | `CDK_PEPPER` | 开发占位值 | CDK 和任务凭证摘要密钥，应与凭据密钥不同 |
 | `VALIDATION_MODE` | `remote` | `remote` 为远端验活，`structural` 仅检查凭据结构 |
-| `VALIDATION_TIMEOUT_SECONDS` | `5` | 单次远端请求超时秒数 |
+| `VALIDATION_TIMEOUT_SECONDS` | `30` | 单次远端请求超时秒数 |
 | `VALIDATION_ATTEMPTS` | `3` | 单个账号的最大验活尝试次数 |
+| `VALIDATION_EGRESS_MODE` | `direct` | 验活出口模式：`direct` 直连、`account` 使用账号出口、`pool` 使用代理池 |
+| `VALIDATION_PROBE_MODE` | `fast` | 验活探测模式：`fast` 检查 userinfo 和 conversation/init，`strict` 额外检查 accounts/check |
+| `VALIDATION_IMPERSONATE` | `chrome146` | curl_cffi 使用的浏览器指纹目标；需使用当前依赖支持的 impersonate 名称 |
 | `VALIDATION_PROXY` | 空 | 验活统一出口代理，留空时直连 |
-| `VALIDATION_RETRY_BASE_SECONDS` | `1` | 临时错误重试的初始等待时间，单位为秒 |
+| `VALIDATION_PROXY_POOL` | 空 | 账号未配置代理且统一代理为空时使用的代理池，支持逗号、分号或换行分隔 |
+| `VALIDATION_RETRY_BASE_SECONDS` | `2` | 临时错误重试的初始等待时间，单位为秒 |
 | `VALIDATION_RETRY_MAX_SECONDS` | `30` | 本地指数退避的最大时间，单位为秒；上游 `Retry-After` 优先 |
-| `VALIDATION_RETRY_JITTER_SECONDS` | `0.25` | 重试等待随机抖动范围，单位为秒 |
-| `VALIDATION_CONCURRENCY` | `6` | 兑换时并行验活的最大任务数 |
+| `VALIDATION_RETRY_JITTER_SECONDS` | `0.5` | 重试等待随机抖动范围，单位为秒 |
+| `VALIDATION_CONCURRENCY` | `2` | 同一进程可同时执行的账号验活任务数量 |
+| `VALIDATION_GATE_THRESHOLD` | `5` | 60 秒内累计达到该数量的风控、Challenge 或限流响应后暂停新的验活请求 |
+| `VALIDATION_COOLDOWN_SECONDS` | `60` | 触发上游冷却后的暂停时间，单位为秒 |
 | `REDELIVERY_WINDOW_SECONDS` | `1800` | 已兑换 CDK 的公开补发窗口（秒），设为 `0` 可关闭补发 |
 | `PUBLIC_BASE_URL` | `http://localhost:1456` | 用户访问服务的外部地址 |
 

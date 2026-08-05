@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import random
+import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -27,6 +30,14 @@ class ValidationResult:
     id_token: str = ""
     expires_at: datetime | None = None
     latency_ms: int = 0
+    stage: str = ""
+    status_code: int | None = None
+    content_type: str = ""
+    server: str = ""
+    cf_mitigated: str = ""
+    cf_ray: str = ""
+    retry_after: float | None = None
+    attempts: int = 0
 
 
 class TokenValidator:
@@ -35,6 +46,14 @@ class TokenValidator:
     chatgpt_base_url = "https://chatgpt.com"
     conversation_init_path = "/backend-api/conversation/init"
     account_check_path = "/backend-api/accounts/check/v4-2023-04-27"
+    chatgpt_validation_impersonate = "chrome146"
+    chatgpt_validation_user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/146.0.0.0 Safari/537.36"
+    )
+    chatgpt_validation_client_version = "prod-497f333866796e100096ad083b51ca949d22e751"
+    chatgpt_validation_build_number = "7646290"
     access_token_expiry_skew = timedelta(seconds=60)
 
     _terminal_refresh_error_codes = frozenset(
@@ -58,18 +77,110 @@ class TokenValidator:
         "session has ended",
     )
 
-    _shared_gate_statuses = frozenset({403, 429})
-
     def __init__(self, settings: Settings, security: SecurityManager):
         self.settings = settings
         self.security = security
+        self._gate_lock = threading.Lock()
+        self._gate_hits: deque[float] = deque()
+        self._cooldown_until = 0.0
+        self._account_lock_guard = threading.Lock()
+        self._account_locks: dict[str, threading.Lock] = {}
+        self._validation_semaphore = threading.BoundedSemaphore(
+            max(1, int(getattr(settings, "validation_concurrency", 1)))
+        )
 
     def _session(self):
-        kwargs: dict[str, Any] = {"impersonate": "chrome120"}
-        proxy = str(self.settings.validation_proxy or "").strip()
-        if proxy:
-            kwargs["proxy"] = proxy
-        return cffi_requests.Session(**kwargs)
+        # Keep the browser profile configurable while using the newest target
+        # supported by the bundled curl_cffi release by default.
+        impersonate = str(
+            getattr(self.settings, "validation_impersonate", "")
+            or self.chatgpt_validation_impersonate
+        ).strip()
+        return cffi_requests.Session(impersonate=impersonate)
+
+    @staticmethod
+    def _proxy_value(value: Any) -> str:
+        if isinstance(value, dict):
+            for key in ("url", "proxy_url", "proxy", "value"):
+                candidate = value.get(key)
+                if candidate is not None:
+                    return str(candidate).strip()
+            return ""
+        return str(value or "").strip()
+
+    def _account_validation_proxy(self, account: Account) -> str:
+        direct_proxy = self._proxy_value(getattr(account, "proxy_used", ""))
+        if direct_proxy:
+            return direct_proxy
+
+        extra_data = getattr(account, "extra_data", None)
+        if isinstance(extra_data, str):
+            try:
+                extra_data = json.loads(extra_data or "{}")
+            except (TypeError, json.JSONDecodeError):
+                extra_data = {}
+        if not isinstance(extra_data, dict):
+            return ""
+
+        for key in ("proxy_used", "proxy_url", "proxy"):
+            proxy = self._proxy_value(extra_data.get(key))
+            if proxy:
+                return proxy
+        return ""
+
+    def _validation_proxy_url(
+        self,
+        account: Account,
+        explicit_proxy: str | None = None,
+    ) -> str | None:
+        explicit = self._proxy_value(explicit_proxy)
+        if explicit:
+            return explicit
+
+        raw_pool = getattr(self.settings, "validation_proxy_pool", "")
+        if isinstance(raw_pool, str):
+            candidates = raw_pool.replace(";", "\n").replace(",", "\n").splitlines()
+        elif isinstance(raw_pool, (list, tuple, set)):
+            candidates = list(raw_pool)
+        else:
+            candidates = []
+        candidates = [self._proxy_value(candidate) for candidate in candidates]
+        candidates = [candidate for candidate in candidates if candidate]
+        configured_proxy = self._proxy_value(getattr(self.settings, "validation_proxy", ""))
+        account_proxy = self._account_validation_proxy(account)
+        mode = str(getattr(self.settings, "validation_egress_mode", "direct") or "direct").strip().lower()
+
+        if mode == "direct":
+            return None
+        if mode == "pool":
+            return random.choice(candidates) if candidates else configured_proxy or None
+        if mode == "account":
+            return account_proxy or configured_proxy or (random.choice(candidates) if candidates else None)
+
+        # Unknown values fail closed to direct access instead of silently
+        # inheriting a historical account proxy.
+        return None
+
+    def _proxy_mapping(self, proxy_url: str | None = None) -> dict[str, str] | None:
+        proxy = self._proxy_value(proxy_url)
+        if not proxy:
+            return None
+        return {"http": proxy, "https": proxy}
+
+    def _request_kwargs(
+        self,
+        headers: dict[str, str],
+        *,
+        proxy_mapping: dict[str, str] | None = None,
+        use_proxy: bool = True,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "headers": headers,
+            "timeout": self.settings.validation_timeout_seconds,
+        }
+        if use_proxy and proxy_mapping:
+            kwargs["proxies"] = proxy_mapping
+        return kwargs
 
     @staticmethod
     def _close_session(session: Any) -> None:
@@ -77,13 +188,6 @@ class TokenValidator:
             session.close()
         except Exception:
             pass
-
-    @staticmethod
-    def _response_json_object(response: Any) -> bool:
-        try:
-            return isinstance(response.json(), dict)
-        except Exception:
-            return False
 
     @staticmethod
     def _seed_chatgpt_device_cookie(session: Any, device_id: str) -> None:
@@ -117,10 +221,6 @@ class TokenValidator:
         except (TypeError, ValueError, OverflowError):
             return None
 
-    @staticmethod
-    def _is_retryable_status(status_code: int) -> bool:
-        return status_code in {403, 408, 425, 429} or status_code >= 500
-
     def _retry_delay_seconds(self, attempt: int, retry_after: float | None = None) -> float:
         base = max(0.0, float(self.settings.validation_retry_base_seconds))
         maximum = max(base, float(self.settings.validation_retry_max_seconds))
@@ -137,51 +237,39 @@ class TokenValidator:
         if delay > 0:
             time.sleep(delay)
 
-    def _validate_oauth_identity(self, access_token: str) -> ValidationResult:
-        started = time.perf_counter()
-        last_message = "远端验证暂不可用"
-        retry_after: float | None = None
-        for attempt in range(self.settings.validation_attempts):
-            session = self._session()
-            try:
-                retry_after = None
-                response = session.get(
-                    self.validation_url,
-                    headers={"authorization": f"Bearer {access_token}", "accept": "application/json"},
-                    timeout=self.settings.validation_timeout_seconds,
-                )
-                elapsed = int((time.perf_counter() - started) * 1000)
-                if response.status_code == 200:
-                    if self._response_json_object(response):
-                        return ValidationResult("valid", latency_ms=elapsed)
-                    last_message = "OAuth 身份响应无效，暂时无法确认"
-                elif response.status_code == 401:
-                    return ValidationResult("invalid", "access_token", "Access Token 无效或已过期", latency_ms=elapsed)
-                elif response.status_code == 429:
-                    last_message = "上游限流，暂时无法确认"
-                    retry_after = self._response_retry_after(response)
-                elif response.status_code == 403:
-                    last_message = "上游风控或访问限制，暂时无法确认"
-                    retry_after = self._response_retry_after(response)
-                elif self._is_retryable_status(response.status_code):
-                    last_message = f"上游服务暂不可用: HTTP {response.status_code}"
-                    retry_after = self._response_retry_after(response)
-                else:
-                    last_message = f"上游验证暂不可用: HTTP {response.status_code}"
-                    retry_after = None
-            except Exception:
-                last_message = "网络或 TLS 错误，暂时无法确认"
-                retry_after = None
-            finally:
-                self._close_session(session)
-            if attempt < self.settings.validation_attempts - 1:
-                self._sleep_before_retry(attempt, retry_after)
-        return ValidationResult(
-            "inconclusive",
-            "transient",
-            last_message,
-            latency_ms=int((time.perf_counter() - started) * 1000),
+    def _validation_cooldown_remaining(self) -> float:
+        now = time.monotonic()
+        with self._gate_lock:
+            return max(0.0, self._cooldown_until - now)
+
+    def _record_gate_hit(self) -> None:
+        now = time.monotonic()
+        threshold = max(1, int(getattr(self.settings, "validation_gate_threshold", 5)))
+        cooldown = max(0.0, float(getattr(self.settings, "validation_cooldown_seconds", 60.0)))
+        with self._gate_lock:
+            window_start = now - 60.0
+            while self._gate_hits and self._gate_hits[0] < window_start:
+                self._gate_hits.popleft()
+            self._gate_hits.append(now)
+            if len(self._gate_hits) >= threshold and cooldown > 0:
+                self._cooldown_until = max(self._cooldown_until, now + cooldown)
+
+    def _account_lock(self, account: Account) -> threading.Lock:
+        account_key = str(
+            getattr(account, "id", None)
+            or getattr(account, "account_id", None)
+            or getattr(account, "email", None)
+            or "unknown"
         )
+        with self._account_lock_guard:
+            return self._account_locks.setdefault(account_key, threading.Lock())
+
+    @staticmethod
+    def _oauth_headers(access_token: str) -> dict[str, str]:
+        return {
+            "authorization": f"Bearer {access_token}",
+            "accept": "application/json",
+        }
 
     def _chatgpt_headers(
         self,
@@ -195,154 +283,334 @@ class TokenValidator:
         headers = {
             "authorization": f"Bearer {access_token}",
             "accept": "application/json",
+            "content-type": content_type or "application/json",
             "origin": self.chatgpt_base_url,
             "referer": f"{self.chatgpt_base_url}/",
+            "user-agent": self.chatgpt_validation_user_agent,
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
             "oai-device-id": device_id,
             "oai-session-id": session_id,
+            "oai-language": "zh-CN",
+            "oai-client-version": self.chatgpt_validation_client_version,
+            "oai-client-build-number": self.chatgpt_validation_build_number,
             "x-openai-target-path": path,
             "x-openai-target-route": path,
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
-        if content_type:
-            headers["content-type"] = content_type
         return headers
 
-    def _probe_chatgpt_once(
+    @staticmethod
+    def _response_metadata(response: Any) -> dict[str, Any]:
+        headers = getattr(response, "headers", None) or {}
+        def header(name: str) -> str:
+            try:
+                return str(headers.get(name) or headers.get(name.lower()) or "").strip()
+            except Exception:
+                return ""
+
+        return {
+            "status_code": int(getattr(response, "status_code", 0) or 0),
+            "content_type": header("content-type"),
+            "server": header("server"),
+            "cf_mitigated": header("cf-mitigated"),
+            "cf_ray": header("cf-ray"),
+            "retry_after": TokenValidator._response_retry_after(response),
+        }
+
+    @staticmethod
+    def _response_error_detail(response: Any) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            for key in ("detail", "message", "error_description", "description"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    nested = (
+                        value.get("message")
+                        or value.get("detail")
+                        or value.get("description")
+                        or value.get("code")
+                    )
+                    if isinstance(nested, str) and nested.strip():
+                        return nested.strip()
+
+            error = payload.get("error")
+            if isinstance(error, str) and error.strip():
+                return error.strip()
+            if isinstance(error, dict):
+                nested = (
+                    error.get("message")
+                    or error.get("detail")
+                    or error.get("description")
+                    or error.get("code")
+                )
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+
+        body_text = str(getattr(response, "text", "") or "").strip()
+        return body_text[:200]
+
+    @staticmethod
+    def _response_is_json_object(response: Any) -> bool:
+        try:
+            return isinstance(response.json(), dict)
+        except Exception:
+            return False
+
+    def _probe_mode(self, probe_mode: str | None = None) -> str:
+        value = str(
+            probe_mode
+            or getattr(self.settings, "validation_probe_mode", "fast")
+            or "fast"
+        ).strip().lower()
+        return "strict" if value == "strict" else "fast"
+
+    @staticmethod
+    def _format_validation_http_error(status_code: int, detail: str) -> str:
+        detail = str(detail or "").strip()
+        if detail:
+            return f"验证失败: HTTP {status_code} - {detail[:200]}"
+        return f"验证失败: HTTP {status_code}"
+
+    def _validation_response_error(self, response: Any, *, stage: str = "") -> str | None:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        detail = self._response_error_detail(response)
+        detail_lower = detail.casefold()
+        stage_suffix = f": {stage}" if stage else ""
+        metadata = self._response_metadata(response)
+        content_type = str(metadata["content_type"]).casefold()
+        is_html = "text/html" in content_type or detail_lower.startswith("<!doctype html") or "<html" in detail_lower[:100]
+        is_json = self._response_is_json_object(response)
+        is_challenge = bool(
+            metadata["cf_mitigated"].casefold() == "challenge"
+            or "cloudflare" in detail_lower
+            or "challenge" in detail_lower
+            or is_html
+            or (status_code in {403, 503} and metadata["server"].casefold() == "cloudflare")
+        )
+
+        # A challenge page can contain words such as "unauthorized" or
+        # "invalid". Classify the response as an upstream access problem
+        # before looking at token-related text so it is never persisted as a
+        # token failure.
+        if is_challenge:
+            if metadata["cf_mitigated"].casefold() == "challenge" or "cloudflare" in detail_lower:
+                reason = "Cloudflare Challenge"
+            else:
+                reason = "上游风控或访问限制"
+            return f"Token 验证暂不可用: {stage or 'validation'}: {reason}"
+
+        if 200 <= status_code < 300:
+            if status_code == 204 or not self._response_is_json_object(response):
+                return f"Token 验证暂不可用: {stage or 'validation'}: 响应格式暂时无法确认"
+            return None
+        if status_code == 401:
+            return f"Token 无效或已过期{stage_suffix}"
+        if status_code == 403:
+            if any(
+                keyword in detail_lower
+                for keyword in ("banned", "deactivated", "suspended", "terminated", "disabled")
+            ) and is_json:
+                return f"账号可能被封禁{stage_suffix}"
+            if any(
+                keyword in detail_lower
+                for keyword in ("token", "access token", "access_token", "expired", "invalid", "unauthorized")
+            ) and is_json:
+                return f"Token 无效或已过期{stage_suffix}"
+
+        if status_code == 403:
+            return f"Token 验证暂不可用: {stage or 'validation'}: 上游风控或访问限制"
+        if status_code in {408, 425, 429} or status_code >= 500:
+            if status_code == 429:
+                return f"Token 验证暂不可用: {stage or 'validation'}: 上游限流"
+            return f"Token 验证暂不可用: {stage or 'validation'}: HTTP {status_code}"
+
+        return f"Token 验证暂不可用: {stage + ': ' if stage else ''}HTTP {status_code}"
+
+    @staticmethod
+    def _validation_error_result(
+        error: str,
+        *,
+        latency_ms: int = 0,
+        stage: str = "",
+        response: Any | None = None,
+        attempts: int = 0,
+    ) -> ValidationResult:
+        metadata = TokenValidator._response_metadata(response) if response is not None else {}
+        if error.startswith("账号可能被封禁"):
+            return ValidationResult("invalid", "banned", error, latency_ms=latency_ms, stage=stage, attempts=attempts, **metadata)
+        if error.startswith("Token 无效或已过期"):
+            return ValidationResult("invalid", "access_token", error, latency_ms=latency_ms, stage=stage, attempts=attempts, **metadata)
+        return ValidationResult("inconclusive", "transient", error, latency_ms=latency_ms, stage=stage, attempts=attempts, **metadata)
+
+    @staticmethod
+    def _is_gate_response(response: Any) -> bool:
+        metadata = TokenValidator._response_metadata(response)
+        status_code = int(metadata.get("status_code") or 0)
+        detail = TokenValidator._response_error_detail(response).casefold()
+        content_type = str(metadata.get("content_type") or "").casefold()
+        return bool(
+            status_code in {403, 408, 425, 429} or status_code >= 500
+            or metadata.get("cf_mitigated", "").casefold() == "challenge"
+            or "challenge" in detail
+            or "cloudflare" in detail
+            or "text/html" in content_type
+        )
+
+    def _request_validation_stage(
         self,
+        session: Any,
         access_token: str,
         *,
-        session: Any | None = None,
-        device_id: str | None = None,
-        session_id: str | None = None,
-    ) -> tuple[str, str, float | None]:
-        """Probe product endpoints while avoiding duplicate requests during a shared gate block."""
-        owns_session = session is None
-        session = session or self._session()
-        device_id = device_id or str(uuid.uuid4())
-        session_id = session_id or str(uuid.uuid4())
-        self._seed_chatgpt_device_cookie(session, device_id)
-        failures: list[str] = []
-        retry_after_hint: float | None = None
-        rejected_probe = ""
-        probes = (
-            (
-                "conversation/init",
-                "post",
-                self.conversation_init_path,
-                self.chatgpt_base_url + self.conversation_init_path,
-                {
+        stage: str,
+        device_id: str,
+        session_id: str,
+        proxy_mapping: dict[str, str] | None,
+    ) -> tuple[str, Any | None, float | None]:
+        if stage == "userinfo":
+            response = session.get(
+                self.validation_url,
+                **self._request_kwargs(
+                    self._oauth_headers(access_token),
+                    proxy_mapping=proxy_mapping,
+                ),
+            )
+        else:
+            path = self.conversation_init_path if stage == "conversation/init" else self.account_check_path
+            url = self.chatgpt_base_url + path
+            payload = None
+            method = "get"
+            if stage == "conversation/init":
+                method = "post"
+                payload = {
                     "gizmo_id": None,
                     "requested_default_model": None,
                     "conversation_id": None,
                     "timezone_offset_min": -480,
-                },
-            ),
-            (
-                "accounts/check",
-                "get",
-                self.account_check_path,
-                self.chatgpt_base_url + self.account_check_path + "?timezone_offset_min=-480",
-                None,
-            ),
-        )
-        try:
-            for name, method, path, url, payload in probes:
-                try:
-                    headers = self._chatgpt_headers(
-                        access_token,
-                        path,
-                        device_id=device_id,
-                        session_id=session_id,
-                        content_type="application/json" if payload is not None else None,
-                    )
-                    if method == "post":
-                        response = session.post(
-                            url,
-                            headers=headers,
-                            json=payload,
-                            timeout=self.settings.validation_timeout_seconds,
-                        )
-                    else:
-                        response = session.get(
-                            url,
-                            headers=headers,
-                            timeout=self.settings.validation_timeout_seconds,
-                        )
-                except Exception:
-                    failures.append(f"{name} 网络或 TLS 错误")
-                    continue
+                }
+            else:
+                url += "?timezone_offset_min=-480"
+            kwargs = self._request_kwargs(
+                self._chatgpt_headers(
+                    access_token,
+                    path,
+                    device_id=device_id,
+                    session_id=session_id,
+                    content_type="application/json",
+                ),
+                proxy_mapping=proxy_mapping,
+            )
+            response = session.post(url, json=payload, **kwargs) if method == "post" else session.get(url, **kwargs)
 
-                if response.status_code == 401:
-                    rejected_probe = rejected_probe or name
-                    continue
-                if response.status_code != 200:
-                    retry_after = self._response_retry_after(response)
-                    if retry_after is not None:
-                        retry_after_hint = max(retry_after_hint or 0.0, retry_after)
-                    if response.status_code == 403:
-                        failure = f"{name} 上游风控或访问限制"
-                    elif response.status_code == 429:
-                        failure = f"{name} 上游限流"
-                    elif response.status_code >= 500:
-                        failure = f"{name} 上游服务暂不可用: HTTP {response.status_code}"
-                    else:
-                        failure = f"{name} 验证暂不可用: HTTP {response.status_code}"
-                    if response.status_code in self._shared_gate_statuses:
-                        if rejected_probe:
-                            return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token", None
-                        return "inconclusive", failure, retry_after
-                    failures.append(failure)
-                    continue
-                if not self._response_json_object(response):
-                    failures.append(f"{name} 响应无效")
-            if rejected_probe:
-                return "invalid", f"ChatGPT {rejected_probe} 拒绝 Access Token", None
-            if not failures:
-                return "valid", "", None
-            return "inconclusive", "；".join(failures), retry_after_hint
+        error = self._validation_response_error(response, stage=stage)
+        return ("valid" if error is None else "invalid" if error.startswith(("Token 无效", "账号可能")) else "inconclusive"), response, self._response_retry_after(response)
+
+    def _validate_access_token(
+        self,
+        access_token: str,
+        *,
+        proxy_mapping: dict[str, str] | None = None,
+        session: Any | None = None,
+        probe_mode: str | None = None,
+    ) -> ValidationResult:
+        started = time.perf_counter()
+        last_message = "Token 验证暂不可用"
+        last_response: Any | None = None
+        total_attempts = 0
+        device_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        owns_session = session is None
+        session = session or self._session()
+        self._seed_chatgpt_device_cookie(session, device_id)
+        stages = ["userinfo", "conversation/init"]
+        if self._probe_mode(probe_mode) == "strict":
+            stages.append("accounts/check")
+
+        try:
+            for stage in stages:
+                for attempt in range(max(1, int(self.settings.validation_attempts))):
+                    try:
+                        total_attempts += 1
+                        outcome, response, retry_after = self._request_validation_stage(
+                            session,
+                            access_token,
+                            stage=stage,
+                            device_id=device_id,
+                            session_id=session_id,
+                            proxy_mapping=proxy_mapping,
+                        )
+                        last_response = response
+                        error = self._validation_response_error(response, stage=stage)
+                        if outcome == "valid":
+                            break
+                        if outcome == "invalid":
+                            return self._validation_error_result(
+                                error or f"Token 无效或已过期: {stage}",
+                                latency_ms=int((time.perf_counter() - started) * 1000),
+                                stage=stage,
+                                response=response,
+                                attempts=total_attempts,
+                            )
+                        last_message = error or f"Token 验证暂不可用: {stage}"
+                        if self._is_gate_response(response):
+                            self._record_gate_hit()
+                        if self._validation_cooldown_remaining() > 0:
+                            return self._validation_error_result(
+                                last_message,
+                                latency_ms=int((time.perf_counter() - started) * 1000),
+                                stage=stage,
+                                response=response,
+                                attempts=total_attempts,
+                            )
+                        if attempt < max(1, int(self.settings.validation_attempts)) - 1:
+                            self._sleep_before_retry(attempt, retry_after)
+                            continue
+                        return self._validation_error_result(
+                            last_message,
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            stage=stage,
+                            response=response,
+                            attempts=total_attempts,
+                        )
+                    except Exception:
+                        last_message = f"Token 验证暂不可用: {stage}: 网络或 TLS 错误"
+                        if attempt < max(1, int(self.settings.validation_attempts)) - 1:
+                            self._sleep_before_retry(attempt)
+                            continue
+                        return ValidationResult(
+                            "inconclusive",
+                            "transient",
+                            last_message,
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            stage=stage,
+                            attempts=total_attempts,
+                        )
+            metadata = self._response_metadata(last_response) if last_response is not None else {}
+            return ValidationResult(
+                "valid",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                stage=stages[-1],
+                attempts=total_attempts,
+                **metadata,
+            )
         finally:
             if owns_session:
                 self._close_session(session)
 
-    def _validate_chatgpt_access(self, access_token: str) -> ValidationResult:
-        started = time.perf_counter()
-        last_message = "ChatGPT 实际能力验证暂不可用"
-        retry_after: float | None = None
-        session = self._session()
-        device_id = str(uuid.uuid4())
-        session_id = str(uuid.uuid4())
-        try:
-            for attempt in range(self.settings.validation_attempts):
-                outcome, message, retry_after = self._probe_chatgpt_once(
-                    access_token,
-                    session=session,
-                    device_id=device_id,
-                    session_id=session_id,
-                )
-                elapsed = int((time.perf_counter() - started) * 1000)
-                if outcome == "valid":
-                    return ValidationResult("valid", latency_ms=elapsed)
-                if outcome == "invalid":
-                    return ValidationResult("invalid", "access_token", message, latency_ms=elapsed)
-                last_message = message or last_message
-                if attempt < self.settings.validation_attempts - 1:
-                    self._sleep_before_retry(attempt, retry_after)
-            return ValidationResult(
-                "inconclusive",
-                "transient",
-                last_message,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-        finally:
-            self._close_session(session)
-
-    def _validate_access_token(self, access_token: str) -> ValidationResult:
-        started = time.perf_counter()
-        identity = self._validate_oauth_identity(access_token)
-        if identity.outcome != "valid":
-            return identity
-        product = self._validate_chatgpt_access(access_token)
-        product.latency_ms = int((time.perf_counter() - started) * 1000)
-        return product
+    def _cooldown_result(self, remaining: float) -> ValidationResult:
+        return ValidationResult(
+            "inconclusive",
+            "transient",
+            f"Token 验证暂不可用: 上游验证处于冷却期，请约 {max(1, int(remaining + 0.999))} 秒后重试",
+            stage="cooldown",
+        )
 
     @classmethod
     def _is_terminal_refresh_failure(cls, response: Any) -> bool:
@@ -384,9 +652,11 @@ class TokenValidator:
                 payload["redirect_uri"] = self.settings.oauth_redirect_uri
             response = session.post(
                 self.token_url,
-                headers={"content-type": "application/x-www-form-urlencoded", "accept": "application/json"},
                 data=payload,
-                timeout=self.settings.validation_timeout_seconds,
+                **self._request_kwargs(
+                    {"content-type": "application/x-www-form-urlencoded", "accept": "application/json"},
+                    use_proxy=False,
+                ),
             )
             elapsed = int((time.perf_counter() - started) * 1000)
             if response.status_code != 200:
@@ -429,8 +699,18 @@ class TokenValidator:
     def _access_token_needs_refresh(self, account: Account) -> bool:
         return bool(account.expires_at and account.expires_at <= utcnow() + self.access_token_expiry_skew)
 
-    def _confirm_refreshed_access(self, refresh_result: ValidationResult) -> ValidationResult:
-        confirmation = self._validate_access_token(refresh_result.access_token)
+    def _confirm_refreshed_access(
+        self,
+        refresh_result: ValidationResult,
+        *,
+        proxy_mapping: dict[str, str] | None = None,
+        probe_mode: str | None = None,
+    ) -> ValidationResult:
+        confirmation = self._validate_access_token(
+            refresh_result.access_token,
+            proxy_mapping=proxy_mapping,
+            probe_mode=probe_mode,
+        )
         confirmation.validated_via = "refresh_token"
         confirmation.access_token = refresh_result.access_token
         confirmation.refresh_token = refresh_result.refresh_token
@@ -443,7 +723,13 @@ class TokenValidator:
             confirmation.message = "刷新后的 Access Token 仍被实际接口拒绝，暂时无法确认"
         return confirmation
 
-    def validate(self, account: Account) -> ValidationResult:
+    def _validate_unlocked(
+        self,
+        account: Account,
+        *,
+        validation_proxy: str | None = None,
+        probe_mode: str | None = None,
+    ) -> ValidationResult:
         access_token = self.security.decrypt(account.access_token_encrypted)
         refresh_token = self.security.decrypt(account.refresh_token_encrypted)
         if self.settings.validation_mode == "structural":
@@ -451,14 +737,28 @@ class TokenValidator:
                 return ValidationResult("valid", "", "结构校验通过", "structural")
             return ValidationResult("invalid", "credentials", "缺少可验证凭据", "structural")
 
+        # Select one validation exit for the whole operation. Refresh-token
+        # requests intentionally remain direct; only token validation uses it.
+        proxy_mapping = self._proxy_mapping(
+            self._validation_proxy_url(account, validation_proxy)
+        )
+
         if refresh_token and (not access_token or self._access_token_needs_refresh(account)):
             refresh_result = self._refresh(refresh_token, account.client_id)
             if refresh_result.outcome != "valid":
                 return refresh_result
-            return self._confirm_refreshed_access(refresh_result)
+            return self._confirm_refreshed_access(
+                refresh_result,
+                proxy_mapping=proxy_mapping,
+                probe_mode=probe_mode,
+            )
 
         if access_token:
-            access_result = self._validate_access_token(access_token)
+            access_result = self._validate_access_token(
+                access_token,
+                proxy_mapping=proxy_mapping,
+                probe_mode=probe_mode,
+            )
             if access_result.outcome == "valid" or access_result.outcome == "inconclusive":
                 return access_result
             if not refresh_token:
@@ -469,7 +769,49 @@ class TokenValidator:
         refresh_result = self._refresh(refresh_token, account.client_id)
         if refresh_result.outcome != "valid":
             return refresh_result
-        return self._confirm_refreshed_access(refresh_result)
+        return self._confirm_refreshed_access(
+            refresh_result,
+            proxy_mapping=proxy_mapping,
+            probe_mode=probe_mode,
+        )
+
+    def validate(
+        self,
+        account: Account,
+        *,
+        validation_proxy: str | None = None,
+        probe_mode: str | None = None,
+    ) -> ValidationResult:
+        account_lock = self._account_lock(account)
+        account_lock.acquire()
+        try:
+            if self.settings.validation_mode == "structural":
+                return self._validate_unlocked(
+                    account,
+                    validation_proxy=validation_proxy,
+                    probe_mode=probe_mode,
+                )
+
+            cooldown = self._validation_cooldown_remaining()
+            if cooldown > 0:
+                return self._cooldown_result(cooldown)
+
+            self._validation_semaphore.acquire()
+            try:
+                # Another validation may have tripped the gate while this
+                # operation was waiting for a concurrency slot.
+                cooldown = self._validation_cooldown_remaining()
+                if cooldown > 0:
+                    return self._cooldown_result(cooldown)
+                return self._validate_unlocked(
+                    account,
+                    validation_proxy=validation_proxy,
+                    probe_mode=probe_mode,
+                )
+            finally:
+                self._validation_semaphore.release()
+        finally:
+            account_lock.release()
 
 
 def apply_validation(
@@ -478,10 +820,33 @@ def apply_validation(
     validator: TokenValidator,
     *,
     preserve_reservation: bool = False,
+    validation_proxy: str | None = None,
+    probe_mode: str | None = None,
 ) -> ValidationResult:
-    result = validator.validate(account)
+    result = validator.validate(
+        account,
+        validation_proxy=validation_proxy,
+        probe_mode=probe_mode,
+    )
     persist_validation_result(session, account, validator, result, preserve_reservation=preserve_reservation)
     return result
+
+
+def validation_result_details(result: ValidationResult) -> dict[str, Any]:
+    """Return safe diagnostic fields for operation logs; never include credentials."""
+    return {
+        "error_type": result.error_type,
+        "validated_via": result.validated_via,
+        "latency_ms": result.latency_ms,
+        "stage": result.stage,
+        "status_code": result.status_code,
+        "content_type": result.content_type,
+        "server": result.server,
+        "cf_mitigated": result.cf_mitigated,
+        "cf_ray": result.cf_ray,
+        "retry_after": result.retry_after,
+        "attempts": result.attempts,
+    }
 
 
 def persist_validation_result(

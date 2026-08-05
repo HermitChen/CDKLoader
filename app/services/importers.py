@@ -29,6 +29,9 @@ CANONICAL_FIELDS = {
     "status",
     "registration_mode",
     "source",
+    "proxy_used",
+    "proxy_url",
+    "proxy",
 }
 
 HEADER_ALIASES = {
@@ -49,6 +52,9 @@ HEADER_ALIASES = {
     "cookies": "cookies",
     "registrationmode": "registration_mode",
     "source": "source",
+    "proxyused": "proxy_used",
+    "proxyurl": "proxy_url",
+    "proxy": "proxy",
 }
 
 
@@ -70,6 +76,7 @@ class ParsedAccount:
     expires_at: datetime | None = None
     registration_mode: str = "codex"
     source: str = "import"
+    proxy_used: str | None = None
     extra_data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -155,6 +162,7 @@ def _extract_known(data: dict[str, Any], locator: str, source: str) -> ParsedAcc
         expires_at=_parse_datetime(value("expires_at") or value("expired"), "expires_at", locator),
         registration_mode=_compact(value("registration_mode") or value("type")) or "codex",
         source=_compact(extra.get("source") if isinstance(extra, dict) else None) or source,
+        proxy_used=_compact(value("proxy_used") or value("proxy_url") or value("proxy")),
         extra_data={key: value for key, value in normalized.items() if key not in known},
     )
     if isinstance(extra, dict):

@@ -36,7 +36,7 @@ from ..services.operations import (
     start_operation_task,
 )
 from ..services.redemption import refresh_cdk_status, serialize_redemption
-from ..services.validator import apply_validation
+from ..services.validator import apply_validation, validation_result_details
 from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
 
 
@@ -489,7 +489,15 @@ def bulk_delete_accounts(payload: BulkDeleteRequest, db: Session = Depends(get_d
     return {"deleted": deleted, "skipped": skipped}
 
 
-def _validate_accounts_task(factory, validator, settings: Settings, task_id: str, account_ids: list[str]) -> None:
+def _validate_accounts_task(
+    factory,
+    validator,
+    settings: Settings,
+    task_id: str,
+    account_ids: list[str],
+    validation_proxy: str | None = None,
+    probe_mode: str = "strict",
+) -> None:
     with factory.begin() as session:
         task = session.get(OperationTask, task_id)
         if not task or task.status not in {"queued", "running"}:
@@ -537,7 +545,13 @@ def _validate_accounts_task(factory, validator, settings: Settings, task_id: str
                     )
                     continue
 
-                result = apply_validation(session, account, validator)
+                result = apply_validation(
+                    session,
+                    account,
+                    validator,
+                    validation_proxy=validation_proxy,
+                    probe_mode=probe_mode,
+                )
                 task.processed += 1
                 if result.outcome == "valid":
                     task.valid_count += 1
@@ -552,11 +566,7 @@ def _validate_accounts_task(factory, validator, settings: Settings, task_id: str
                     task_id=task_id,
                     account_id=account.id,
                     message=result.message or f"验活结果：{result.outcome}",
-                    details={
-                        "error_type": result.error_type,
-                        "validated_via": result.validated_via,
-                        "latency_ms": result.latency_ms,
-                    },
+                    details=validation_result_details(result),
                 )
         except Exception:
             with factory.begin() as session:
@@ -665,6 +675,8 @@ def validate_accounts(
             request.app.state.settings,
             task.id,
             accepted_ids,
+            payload.proxy,
+            payload.probe_mode or "strict",
         )
     return JSONResponse(
         content={"accepted": len(accepted_ids), "skipped": skipped},

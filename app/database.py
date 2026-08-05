@@ -42,10 +42,15 @@ def apply_compatibility_migrations(engine: Engine) -> None:
     """Apply the small SQLite compatibility migration needed by the MVP."""
     if engine.dialect.name != "sqlite":
         return
-    columns = {column["name"] for column in inspect(engine).get_columns("cdks")}
-    if "code_encrypted" not in columns:
+    inspector = inspect(engine)
+    cdk_columns = {column["name"] for column in inspector.get_columns("cdks")}
+    account_columns = {column["name"] for column in inspector.get_columns("accounts")}
+    if "code_encrypted" not in cdk_columns or "proxy_used" not in account_columns:
         with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE cdks ADD COLUMN code_encrypted TEXT"))
+            if "code_encrypted" not in cdk_columns:
+                connection.execute(text("ALTER TABLE cdks ADD COLUMN code_encrypted TEXT"))
+            if "proxy_used" not in account_columns:
+                connection.execute(text("ALTER TABLE accounts ADD COLUMN proxy_used VARCHAR(1024)"))
 
 
 def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:

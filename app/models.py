@@ -65,6 +65,7 @@ class Account(Base):
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[str] = mapped_column(String(64), default="import", index=True)
     registration_mode: Mapped[str] = mapped_column(String(32), default="codex", index=True)
+    proxy_used: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending_validation", index=True)
     password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
