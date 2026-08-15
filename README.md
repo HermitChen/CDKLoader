@@ -39,8 +39,9 @@ ADMIN_PASSWORD=替换为强密码
 ADMIN_TOKEN=替换为随机长字符串
 CREDENTIAL_SECRET=替换为随机长字符串
 CDK_PEPPER=替换为另一段随机长字符串
-PUBLIC_BASE_URL=https://cdk.example.com
 ```
+
+服务启动后，登录管理后台的“系统参数”页面设置公开服务地址、验活参数、导入限制和自动清理策略。
 
 可以使用 OpenSSL 生成随机值：
 
@@ -98,24 +99,9 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 | `ADMIN_TOKEN` | `change-me-admin-token` | 管理 API Bearer Token，生产环境必须修改 |
 | `CREDENTIAL_SECRET` | 开发占位值 | 账号凭据加密密钥，修改后无法解密已有数据 |
 | `CDK_PEPPER` | 开发占位值 | CDK 和任务凭证摘要密钥，应与凭据密钥不同 |
-| `VALIDATION_MODE` | `remote` | `remote` 为远端验活，`structural` 仅检查凭据结构 |
-| `VALIDATION_TIMEOUT_SECONDS` | `30` | 单次远端请求超时秒数 |
-| `VALIDATION_ATTEMPTS` | `3` | 单个账号的最大验活尝试次数 |
-| `VALIDATION_EGRESS_MODE` | `direct` | 验活出口模式：`direct` 直连、`account` 使用账号出口、`pool` 使用代理池 |
-| `VALIDATION_PROBE_MODE` | `fast` | 验活探测模式：`fast` 检查 userinfo 和 conversation/init，`strict` 额外检查 accounts/check |
-| `VALIDATION_IMPERSONATE` | `chrome146` | curl_cffi 使用的浏览器指纹目标；需使用当前依赖支持的 impersonate 名称 |
-| `VALIDATION_PROXY` | 空 | 验活统一出口代理，留空时直连 |
-| `VALIDATION_PROXY_POOL` | 空 | 账号未配置代理且统一代理为空时使用的代理池，支持逗号、分号或换行分隔 |
-| `VALIDATION_RETRY_BASE_SECONDS` | `2` | 临时错误重试的初始等待时间，单位为秒 |
-| `VALIDATION_RETRY_MAX_SECONDS` | `30` | 本地指数退避的最大时间，单位为秒；上游 `Retry-After` 优先 |
-| `VALIDATION_RETRY_JITTER_SECONDS` | `0.5` | 重试等待随机抖动范围，单位为秒 |
-| `VALIDATION_CONCURRENCY` | `2` | 同一进程可同时执行的账号验活任务数量 |
-| `VALIDATION_GATE_THRESHOLD` | `5` | 60 秒内累计达到该数量的风控、Challenge 或限流响应后暂停新的验活请求 |
-| `VALIDATION_COOLDOWN_SECONDS` | `60` | 触发上游冷却后的暂停时间，单位为秒 |
-| `REDELIVERY_WINDOW_SECONDS` | `1800` | 已兑换 CDK 的公开补发窗口（秒），设为 `0` 可关闭补发 |
-| `PUBLIC_BASE_URL` | `http://localhost:1456` | 用户访问服务的外部地址 |
+其余运行参数均保存在数据库中，由管理后台“系统参数”页面维护。包括验活模式、超时、并发、代理与重试策略；CDK 补发窗口与公开地址；导入文件大小和数量限制；任务日志、账号、耗尽 CDK 及导出文件的自动清理时间。账号和耗尽 CDK 的清理参数设为 `0` 可关闭对应自动删除。
 
-完整示例及逐项注释见 [.env.example](.env.example)。
+环境文件只保留容器端口、镜像、数据库地址和启动所需的认证/加密密钥；完整示例见 [.env.example](.env.example)。
 
 ## 账号导入
 
@@ -146,7 +132,7 @@ accounts_20260801_153045_<redemption-task-id>.zip
     └── user@example.com_sub2api.json
 ```
 
-原始下载链接只能成功使用一次。若 CDK 已成功兑换，在 `REDELIVERY_WINDOW_SECONDS` 指定的窗口内再次提交同一 CDK，系统会直接复用首次兑换任务已经落盘的文件，不会重新打包、验活、分配账号或扣减额度；每次补发仍使用新的单次下载链接。窗口结束后，公开页面不再支持补发，管理员可在账号池中按关联关系二次导出。已交付文件包含敏感凭据，请在受控环境中保存和传输。
+原始下载链接只能成功使用一次。若 CDK 已成功兑换，在管理后台“系统参数”的补发窗口内再次提交同一 CDK，系统会直接复用首次兑换任务已经落盘的文件，不会重新打包、验活、分配账号或扣减额度；每次补发仍使用新的单次下载链接。窗口结束后，公开页面不再支持补发，管理员可在账号池中按关联关系二次导出。已交付文件包含敏感凭据，请在受控环境中保存和传输。
 
 ## 验活行为
 
@@ -155,7 +141,7 @@ accounts_20260801_153045_<redemption-task-id>.zip
 - 导入账号时，可以选择立即预验活。
 - 用户兑换时，系统会对候选账号实时验活；失效账号不会交付，并会继续从库存补位。
 - `remote` 模式先验证 OAuth `userinfo`，再验证 ChatGPT 的会话初始化和账户检查接口。实际接口 `401` 会强制使用 Refresh Token 恢复并复检；网络、限流、风控和服务端错误会标记为暂无法确认，不会直接判定失效。
-- `VALIDATION_MODE=structural` 只适合本地开发和自动化测试，不应作为生产验活模式。
+- 管理后台“系统参数”中的结构检查模式只适合本地开发和自动化测试，不应作为生产验活模式。
 
 ## 从源码开发
 

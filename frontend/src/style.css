@@ -99,6 +99,8 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .list-toolbar > div:last-child { flex: 1 1 auto; }
 .selection-actions, .filter-group { display: flex; align-items: center; gap: 8px; }
 .selection-actions { min-height: 34px; flex: 0 0 auto; color: hsl(var(--muted-foreground)); font-size: 12px; }
+.random-selection-control { display: inline-flex; align-items: center; gap: 5px; }
+.random-count-input { width: 76px; }
 .selection-count { margin-left: 10px; padding-left: 18px; border-left: 1px solid hsl(var(--border)); white-space: nowrap; }
 .filter-group { width: 100%; flex-wrap: nowrap; justify-content: flex-end; }
 .search-field, .quota-search-field { display: flex; height: 32px; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid hsl(var(--input)); border-radius: 999px; color: hsl(var(--muted-foreground)); background: hsl(var(--background)); }
@@ -133,6 +135,11 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .relation-stack { display: grid; gap: 5px; }
 .delivery-summary { display: grid; gap: 5px; }
 .logs-view { min-width: 0; min-height: 0; overflow: hidden; padding-bottom: 8px; }
+.settings-view { min-width: 0; overflow: auto; padding-bottom: 8px; }
+.settings-sections { display: grid; gap: 14px; padding-bottom: 12px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; }
+.settings-grid .ui-form-field { min-width: 0; }
+.setting-description { display: block; margin-top: 6px; color: hsl(var(--muted-foreground)); font-size: 10px; line-height: 1.45; }
 .logs-task-subsection, .logs-subsection { display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
 .logs-task-subsection { flex: 0 1 310px; min-height: 190px; }
 .logs-task-subsection .data-table { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
@@ -230,11 +237,12 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
   .logs-task-subsection, .logs-subsection { flex: 1 1 0; }
   .logs-task-subsection { min-height: 180px; }
   .logs-task-subsection .data-table, .logs-subsection .data-table { max-height: none; }
+  .settings-grid { grid-template-columns: 1fr; gap: 15px; }
   .operation-task-detail { max-height: calc(100svh - 180px); }
   .task-detail-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pagination-bar { align-items: flex-start; flex-direction: column; gap: 8px; }
   .pagination-controls { width: 100%; justify-content: space-between; }
-  .selection-actions { flex-wrap: wrap; }
+  .selection-actions { width: 100%; flex: 1 1 100%; flex-wrap: wrap; }
   .selection-count { margin-left: 0; padding-left: 0; border-left: 0; }
   .import-dialog-body { grid-template-columns: 1fr; }
   .preview-surface { grid-column: auto; }

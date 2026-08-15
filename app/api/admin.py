@@ -9,7 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import Settings
-from ..dependencies import get_db, get_security, get_settings_from_app, require_admin
+from ..dependencies import get_db, get_security, require_admin
 from ..models import (
     Account,
     AccountImport,
@@ -22,7 +22,15 @@ from ..models import (
     RedemptionCDK,
     utcnow,
 )
-from ..schemas import AccountExportRequest, AccountValidateRequest, AdminLoginRequest, BulkDeleteRequest, CDKGenerateRequest, CDKImportRequest
+from ..schemas import (
+    AccountExportRequest,
+    AccountValidateRequest,
+    AdminLoginRequest,
+    BulkDeleteRequest,
+    CDKGenerateRequest,
+    CDKImportRequest,
+    SystemSettingsUpdate,
+)
 from ..security import SecurityManager
 from ..services.import_service import AccountImportService, serialize_import
 from ..services.importers import ImportParseException, ParsedBatch, parse_import_files
@@ -36,6 +44,7 @@ from ..services.operations import (
     start_operation_task,
 )
 from ..services.redemption import refresh_cdk_status, serialize_redemption
+from ..services.system_settings import settings_payload, update_system_settings
 from ..services.validator import apply_validation, validation_result_details
 from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
 
@@ -152,6 +161,32 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         ),
         "validation_mode": request.app.state.settings.validation_mode,
     }
+
+
+@router.get("/settings", dependencies=[Depends(require_admin)])
+def list_system_settings(request: Request):
+    return settings_payload(request.app.state.settings)
+
+
+@router.put("/settings", dependencies=[Depends(require_admin)])
+def save_system_settings(
+    payload: SystemSettingsUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    try:
+        updated_settings = update_system_settings(
+            db,
+            request.app.state.settings,
+            payload.values,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    request.app.state.apply_runtime_settings(updated_settings)
+    return settings_payload(updated_settings)
 
 
 @router.get("/operation-tasks", dependencies=[Depends(require_admin)])
@@ -432,6 +467,25 @@ def _account_query(
             )
         )
     return query.order_by(Account.created_at.desc())
+
+
+@router.get("/accounts/random-selection", dependencies=[Depends(require_admin)])
+def random_select_accounts(
+    db: Session = Depends(get_db),
+    current_status: str | None = Query(default=None, alias="status"),
+    has_refresh_token: bool | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=320),
+    cdk_id: str | None = Query(default=None, max_length=36),
+    redemption_id: str | None = Query(default=None, max_length=36),
+    count: int = Query(..., ge=1, le=5000),
+):
+    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id)
+    total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
+    if count > total:
+        raise HTTPException(status_code=400, detail=f"随机选择数量不能超过当前筛选结果（{total} 个账号）")
+
+    accounts = db.scalars(query.order_by(None).order_by(func.random()).limit(count)).all()
+    return {"total": total, "count": len(accounts), "ids": [account.id for account in accounts]}
 
 
 @router.post("/accounts/export", dependencies=[Depends(require_admin)])

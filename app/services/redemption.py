@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload, sessionmaker
 
 from ..models import Account, CDK, DeliveryItem, Redelivery, RedeliveryItem, Redemption, RedemptionCDK, utcnow
@@ -273,7 +273,7 @@ class RedemptionService:
             query = query.where(Account.source == cdk.account_source)
         if cdk.registration_mode:
             query = query.where(Account.registration_mode == cdk.registration_mode)
-        return query.order_by(Account.validated_at.desc().nullslast(), Account.created_at.asc())
+        return query.order_by(func.random())
 
     def _reserve_accounts(self, redemption_id: str, cdk_id: str, desired: int) -> list[str]:
         if desired <= 0:

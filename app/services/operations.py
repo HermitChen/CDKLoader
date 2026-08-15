@@ -6,11 +6,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import PROJECT_ROOT, Settings
-from ..models import OperationLog, OperationTask, Redelivery, RedeliveryItem, Redemption, utcnow
+from ..models import (
+    Account,
+    CDK,
+    DeliveryItem,
+    OperationLog,
+    OperationTask,
+    Redelivery,
+    RedeliveryItem,
+    Redemption,
+    RedemptionCDK,
+    utcnow,
+)
 from ..time import to_china_iso
 
 
@@ -158,8 +169,9 @@ def _safe_artifact_path(directory: Path, file_name: str | None) -> Path | None:
     return candidate
 
 
-def _referenced_artifact_names(factory: sessionmaker[Session]) -> set[str]:
+def _referenced_artifact_names(factory: sessionmaker[Session], settings: Settings) -> set[str]:
     now = utcnow()
+    task_cutoff = now - timedelta(days=max(1, settings.operation_log_retention_days))
     with factory() as session:
         names = set(
             name
@@ -191,9 +203,8 @@ def _referenced_artifact_names(factory: sessionmaker[Session]) -> set[str]:
                 select(OperationTask.file_name).where(
                     OperationTask.file_name.is_not(None),
                     (
-                        OperationTask.expires_at.is_(None)
-                        | (OperationTask.expires_at > now)
-                        | OperationTask.status.in_({"queued", "running"})
+                        OperationTask.status.in_({"queued", "running"})
+                        | (func.coalesce(OperationTask.completed_at, OperationTask.created_at) > task_cutoff)
                     ),
                 )
             ).all()
@@ -242,8 +253,8 @@ def cleanup_operation_data(
 
         expired_tasks = session.scalars(
             select(OperationTask).where(
-                OperationTask.expires_at.is_not(None),
-                OperationTask.expires_at <= now,
+                OperationTask.status.in_({"completed", "failed"}),
+                func.coalesce(OperationTask.completed_at, OperationTask.created_at) <= cutoff,
             )
         ).all()
         expired_task_ids = {task.id for task in expired_tasks}
@@ -291,7 +302,7 @@ def cleanup_operation_data(
         except OSError:
             logger.warning("unable to remove expired export artifact %s", artifact)
 
-    referenced_names = _referenced_artifact_names(factory)
+    referenced_names = _referenced_artifact_names(factory, settings)
     artifact_cutoff = datetime.now().timestamp() - max(300, settings.export_retention_seconds)
     try:
         for artifact in directory.iterdir():
@@ -308,3 +319,120 @@ def cleanup_operation_data(
         logger.warning("unable to scan export directory %s", directory)
 
     return deleted_tasks, deleted_logs
+
+
+def _delete_account_data(session: Session, account: Account) -> None:
+    redelivery_ids = set(
+        session.scalars(
+            select(RedeliveryItem.redelivery_id).where(RedeliveryItem.account_id == account.id)
+        ).all()
+    )
+    session.execute(delete(DeliveryItem).where(DeliveryItem.account_id == account.id))
+    session.execute(delete(RedeliveryItem).where(RedeliveryItem.account_id == account.id))
+    for redelivery_id in redelivery_ids:
+        if not session.scalar(
+            select(RedeliveryItem.id).where(RedeliveryItem.redelivery_id == redelivery_id).limit(1)
+        ):
+            redelivery = session.get(Redelivery, redelivery_id)
+            if redelivery:
+                session.delete(redelivery)
+    session.delete(account)
+
+
+def _delete_cdk_data(session: Session, cdk: CDK) -> None:
+    relations = session.scalars(
+        select(RedemptionCDK).where(RedemptionCDK.cdk_id == cdk.id)
+    ).all()
+    redemption_ids = {relation.redemption_id for relation in relations}
+    redelivery_ids = set(
+        session.scalars(
+            select(RedeliveryItem.redelivery_id).where(RedeliveryItem.cdk_id == cdk.id)
+        ).all()
+    )
+    session.execute(delete(DeliveryItem).where(DeliveryItem.cdk_id == cdk.id))
+    session.execute(delete(RedeliveryItem).where(RedeliveryItem.cdk_id == cdk.id))
+    session.execute(delete(RedemptionCDK).where(RedemptionCDK.cdk_id == cdk.id))
+    session.flush()
+    for redelivery_id in redelivery_ids:
+        if not session.scalar(
+            select(RedeliveryItem.id).where(RedeliveryItem.redelivery_id == redelivery_id).limit(1)
+        ):
+            redelivery = session.get(Redelivery, redelivery_id)
+            if redelivery:
+                session.delete(redelivery)
+    for redemption_id in redemption_ids:
+        if not session.scalar(
+            select(RedemptionCDK.id).where(RedemptionCDK.redemption_id == redemption_id).limit(1)
+        ):
+            redemption = session.get(Redemption, redemption_id)
+            if redemption:
+                session.delete(redemption)
+    session.delete(cdk)
+
+
+def cleanup_inventory_data(
+    factory: sessionmaker[Session],
+    settings: Settings,
+) -> tuple[int, int]:
+    """Delete old terminal accounts and exhausted CDKs without touching active work."""
+    now = utcnow()
+    deleted_accounts = 0
+    deleted_cdks = 0
+    account_days = max(0, settings.account_auto_delete_days)
+    cdk_days = max(0, settings.exhausted_cdk_auto_delete_days)
+
+    with factory.begin() as session:
+        if account_days:
+            account_cutoff = now - timedelta(days=account_days)
+            delivered_timestamp = func.coalesce(
+                Account.delivered_at,
+                Account.updated_at,
+                Account.created_at,
+            )
+            invalid_timestamp = func.coalesce(
+                Account.validated_at,
+                Account.updated_at,
+                Account.created_at,
+            )
+            accounts = session.scalars(
+                select(Account).where(
+                    (
+                        (Account.status == "delivered") & (delivered_timestamp <= account_cutoff)
+                    )
+                    | (
+                        Account.status.in_({"expired", "banned"})
+                        & (invalid_timestamp <= account_cutoff)
+                    )
+                )
+            ).all()
+            for account in accounts:
+                _delete_account_data(session, account)
+                deleted_accounts += 1
+
+        if cdk_days:
+            cdk_cutoff = now - timedelta(days=cdk_days)
+            cdks = session.scalars(
+                select(CDK).where(
+                    CDK.remaining_quota <= 0,
+                    CDK.reserved_quota <= 0,
+                    CDK.updated_at <= cdk_cutoff,
+                )
+            ).all()
+            for cdk in cdks:
+                if cdk.disabled or (cdk.expires_at and cdk.expires_at <= now):
+                    continue
+                active_redemption = session.scalar(
+                    select(Redemption.id)
+                    .join(RedemptionCDK)
+                    .where(
+                        RedemptionCDK.cdk_id == cdk.id,
+                        Redemption.status.in_({"queued", "processing"}),
+                    )
+                    .limit(1)
+                )
+                if active_redemption:
+                    continue
+                _delete_cdk_data(session, cdk)
+                deleted_cdks += 1
+
+    return deleted_accounts, deleted_cdks

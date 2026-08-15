@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Clipboard,
   CloudDownload,
+  Dices,
   Download,
   FileUp,
   Gauge,
@@ -18,6 +19,8 @@ import {
   LogOut,
   PackageOpen,
   RefreshCw,
+  Save,
+  Settings2,
   Search,
   ScrollText,
   ShieldCheck,
@@ -39,6 +42,7 @@ import {
   ModalShell,
   StatCard,
   StatusPill,
+  SelectMenu,
   TableShell,
   Toast,
   ToolbarShell,
@@ -71,6 +75,7 @@ const operationTaskDetailLoading = ref(false)
 const operationTaskDetailError = ref('')
 let adminTaskPollTimer = null
 let adminTaskMessageTimer = null
+let settingsMessageTimer = null
 let adminTaskRefreshBusy = false
 let operationViewPollTimer = null
 let operationViewRefreshBusy = false
@@ -104,6 +109,7 @@ const selectedAccountIds = ref([])
 const selectedCdkIds = ref([])
 const selectedRedemptionIds = ref([])
 const selectionBusy = ref('')
+const randomAccountCount = ref('')
 const accountMessage = ref('')
 const redemptionMessage = ref('')
 const toasts = ref([])
@@ -111,6 +117,10 @@ const deleteDialog = ref({ open: false, kind: '', count: 0, label: '' })
 const reissueDialog = ref({ open: false, id: '', prefix: '' })
 const accountImportOpen = ref(false)
 const cdkGeneratorOpen = ref(false)
+const systemSettings = ref([])
+const settingsSaving = ref(false)
+const settingsMessage = ref('')
+const settingsError = ref('')
 
 const importFiles = ref([])
 const importInput = ref(null)
@@ -123,6 +133,7 @@ const cdkForm = ref({ count: 1, quota: 1, export_format: 'json' })
 const generatedCodes = ref([])
 const cdkMessage = ref('')
 const cdkFilterMessage = ref('')
+const transientMessageTimers = new Map()
 
 const codeInput = ref('')
 const redeemBusy = ref(false)
@@ -138,6 +149,7 @@ const navItems = [
   { id: 'cdks', label: 'CDK', icon: KeyRound },
   { id: 'redemptions', label: '兑换记录', icon: Archive },
   { id: 'logs', label: '任务日志', icon: ScrollText },
+  { id: 'settings', label: '系统参数', icon: Settings2 },
 ]
 
 const accountStatusOptions = [
@@ -168,6 +180,7 @@ const pageMeta = {
   cdks: { title: 'CDK', description: '管理提取码、额度、有效期和已兑换账号。' },
   redemptions: { title: '兑换记录', description: '查看完整 CDK、交付状态和关联账号。' },
   logs: { title: '任务日志', description: '查看验活、导出和导入任务的进度与结果。' },
+  settings: { title: '系统参数', description: '调整运行参数和自动清理策略，修改后立即生效。' },
 }
 
 const publicCodes = computed(() => codeInput.value.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean))
@@ -303,6 +316,7 @@ async function loadAdminData() {
       loadRedemptions(),
       loadOperationTasks(),
       loadOperationLogs(),
+      loadSettings(),
     ])
   } catch (error) {
     if (error instanceof ApiError && /认证/.test(error.message)) logout()
@@ -311,6 +325,12 @@ async function loadAdminData() {
 
 async function loadDashboard() {
   dashboard.value = await adminRequest('/admin/dashboard')
+}
+
+async function loadSettings() {
+  const result = await adminRequest('/admin/settings')
+  systemSettings.value = result.groups || []
+  settingsError.value = ''
 }
 
 function normalizedPageSize(value) {
@@ -401,6 +421,43 @@ function scheduleAdminTaskMessageClear() {
     accountMessage.value = ''
     accountValidationTask.value = null
     adminTaskMessageTimer = null
+  }, 5000)
+}
+
+function clearTransientMessageTimer(key) {
+  const timer = transientMessageTimers.get(key)
+  if (timer) window.clearTimeout(timer)
+  transientMessageTimers.delete(key)
+}
+
+function watchTransientMessage(messageRef, key) {
+  watch(messageRef, (message) => {
+    clearTransientMessageTimer(key)
+    if (!message) return
+    transientMessageTimers.set(key, window.setTimeout(() => {
+      if (messageRef.value === message) messageRef.value = ''
+      transientMessageTimers.delete(key)
+    }, 5000))
+  })
+}
+
+watchTransientMessage(redemptionMessage, 'redemption')
+watchTransientMessage(importMessage, 'import')
+watchTransientMessage(cdkMessage, 'cdk')
+watchTransientMessage(cdkFilterMessage, 'cdk-filter')
+
+function clearSettingsMessageTimer() {
+  if (settingsMessageTimer) {
+    window.clearTimeout(settingsMessageTimer)
+    settingsMessageTimer = null
+  }
+}
+
+function scheduleSettingsMessageClear() {
+  clearSettingsMessageTimer()
+  settingsMessageTimer = window.setTimeout(() => {
+    settingsMessage.value = ''
+    settingsMessageTimer = null
   }, 5000)
 }
 
@@ -568,6 +625,7 @@ async function loadActiveView(view = activeView.value) {
   if (view === 'cdks') return loadCdks()
   if (view === 'redemptions') return loadRedemptions()
   if (view === 'logs') return Promise.all([loadOperationTasks(), loadOperationLogs()])
+  if (view === 'settings') return loadSettings()
   return null
 }
 
@@ -799,6 +857,34 @@ function clearAccountRelationFilter() {
   loadAccounts({ clearSelection: true })
 }
 
+async function saveSettings() {
+  if (settingsSaving.value) return
+  settingsSaving.value = true
+  clearSettingsMessageTimer()
+  settingsMessage.value = ''
+  settingsError.value = ''
+  const values = Object.fromEntries(
+    systemSettings.value.flatMap((group) => group.items.map((item) => [item.key, item.value])),
+  )
+  try {
+    const result = await adminRequest('/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values }),
+    })
+    systemSettings.value = result.groups || []
+    settingsMessage.value = '系统参数已保存并立即生效。'
+    scheduleSettingsMessageClear()
+    pushToast('success', '参数已保存', '新的运行配置已经生效。')
+    await loadDashboard()
+  } catch (error) {
+    settingsError.value = error.message
+    pushToast('error', '保存参数失败', error.message)
+  } finally {
+    settingsSaving.value = false
+  }
+}
+
 function openCdkForAccount(account) {
   const cdk = account.related_cdk
   if (!cdk) return
@@ -878,6 +964,33 @@ async function toggleAllResults(kind) {
     config.selected.value = result.items.map((item) => item.id)
   } catch (error) {
     pushToast('error', '跨页全选失败', error.message)
+  } finally {
+    selectionBusy.value = ''
+  }
+}
+
+async function selectRandomAccounts() {
+  if (selectionBusy.value || accountValidationBusy.value || accountExportBusy.value) return
+  const count = Number(randomAccountCount.value)
+  const maximum = Math.min(accountTotal.value, maxBulkSelection)
+  if (!Number.isInteger(count) || count < 1) {
+    pushToast('warning', '请输入选择数量', '请输入一个大于 0 的整数。')
+    return
+  }
+  if (count > maximum) {
+    pushToast('warning', '选择数量超出范围', `当前筛选结果最多可随机选择 ${maximum} 个账号。`)
+    return
+  }
+
+  selectionBusy.value = 'accounts-random'
+  try {
+    const params = filterParams(accountFilters.value)
+    params.set('count', String(count))
+    const result = await adminRequest(`/admin/accounts/random-selection${queryString(params)}`)
+    selectedAccountIds.value = result.ids
+    pushToast('success', '已随机选择账号', `已从当前筛选结果中选择 ${result.count} 个账号。`)
+  } catch (error) {
+    pushToast('error', '随机选择失败', error.message)
   } finally {
     selectionBusy.value = ''
   }
@@ -1286,6 +1399,8 @@ onMounted(async () => {
 onUnmounted(() => {
   stopAdminTaskPolling()
   clearAdminTaskMessageTimer()
+  clearSettingsMessageTimer()
+  for (const key of transientMessageTimers.keys()) clearTransientMessageTimer(key)
   stopOperationViewPolling()
   stopOperationTaskDetailPolling()
   closeExportStream()
@@ -1355,7 +1470,7 @@ onUnmounted(() => {
           <h1>{{ activePageMeta.title }}</h1>
           <p class="page-description">{{ activePageMeta.description }}</p>
         </div>
-        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || accountValidationBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
+        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || accountValidationBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton v-if="activeView === 'settings'" type="button" variant="primary" size="sm" :disabled="settingsSaving" @click="saveSettings"><LoaderCircle v-if="settingsSaving" :size="15" class="spin" /><Save v-else :size="15" />保存参数</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
       </header>
 
       <section v-if="activeView === 'overview'" class="overview-view">
@@ -1370,10 +1485,27 @@ onUnmounted(() => {
         </FormSection>
       </section>
 
+      <section v-if="activeView === 'settings'" class="workspace-section settings-view">
+        <CalloutBox v-if="settingsMessage" tone="success" variant="soft" size="sm" class="section-message">{{ settingsMessage }}</CalloutBox>
+        <CalloutBox v-if="settingsError" tone="error" variant="soft" size="sm" class="section-message">{{ settingsError }}</CalloutBox>
+        <div v-if="systemSettings.length" class="settings-sections">
+          <FormSection v-for="group in systemSettings" :key="group.key" :title="group.label" variant="outline" size="sm">
+            <div class="settings-grid">
+              <FormField v-for="item in group.items" :key="item.key" :label="item.label">
+                <SelectMenu v-if="item.type === 'select'" v-model="item.value" :options="item.options" width="full" placement="auto" :aria-label="item.label" />
+                <NInput v-else v-model="item.value" :type="item.type === 'integer' || item.type === 'number' ? 'number' : 'text'" :min="item.min ?? undefined" :max="item.max ?? undefined" :step="item.type === 'number' ? 'any' : '1'" size="sm" block :aria-label="item.label" />
+                <small class="setting-description">{{ item.description }}<span v-if="item.unit"> · {{ item.unit }}</span></small>
+              </FormField>
+            </div>
+          </FormSection>
+        </div>
+        <CalloutBox v-else-if="!settingsError" tone="info" variant="soft" size="sm"><LoaderCircle :size="15" class="spin" />正在读取系统参数...</CalloutBox>
+      </section>
+
       <section v-if="activeView === 'accounts'" class="workspace-section">
         <ToolbarShell class="list-toolbar" stack-on-mobile>
-          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><NButton v-if="accountTotal > accounts.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy) || accountValidationBusy || accountExportBusy" @click="toggleAllResults('accounts')"><LoaderCircle v-if="selectionBusy === 'accounts'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allAccountResultsSelected ? '取消全部选择' : `选择全部 ${accountTotal} 项` }}</NButton><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="outline" size="xs" :disabled="accountValidationBusy || accountExportBusy" @click="validateSelectedAccounts"><LoaderCircle v-if="accountValidationBusy" :size="15" class="spin" /><ShieldCheck v-else :size="15" />批量验活</NButton><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" :disabled="accountValidationBusy || accountExportBusy" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
-          <template #end><div class="filter-group"><span v-if="accountFilters.relation_label" class="relation-filter"><span :title="accountFilters.relation_label">{{ accountFilters.relation_label }}</span><NButton type="button" variant="outline" size="xs" icon-only title="清除关联筛选" @click="clearAccountRelationFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput v-model="accountFilters.q" size="sm" placeholder="搜索账号、来源或 ID" aria-label="搜索账号" @keyup.enter="searchAccounts" /></div><FilterSelect v-model="accountFilters.has_refresh_token" :options="refreshTokenOptions" size="sm" aria-label="Refresh Token 筛选" @update:model-value="searchAccounts" /><FilterSelect v-model="accountFilters.status" :options="accountStatusOptions" size="sm" aria-label="账号状态筛选" @update:model-value="searchAccounts" /></div></template>
+          <template #start><div class="selection-actions"><div class="list-summary"><span>当前结果</span><strong>{{ accountTotal }}</strong><span>个账号</span></div><div v-if="accountTotal" class="random-selection-control"><NInput id="random-account-count" name="random-account-count" v-model="randomAccountCount" type="number" min="1" :max="Math.min(accountTotal, maxBulkSelection)" size="sm" class="random-count-input" placeholder="数量" aria-label="随机选择账号数量" @keyup.enter="selectRandomAccounts" /><NButton type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy) || accountValidationBusy || accountExportBusy" title="从当前筛选结果中随机选择指定数量账号" @click="selectRandomAccounts"><LoaderCircle v-if="selectionBusy === 'accounts-random'" :size="15" class="spin" /><Dices v-else :size="15" />随机选择</NButton></div><NButton v-if="accountTotal > accounts.length" type="button" variant="outline" size="xs" :disabled="Boolean(selectionBusy) || accountValidationBusy || accountExportBusy" @click="toggleAllResults('accounts')"><LoaderCircle v-if="selectionBusy === 'accounts'" :size="15" class="spin" /><ListChecks v-else :size="15" />{{ allAccountResultsSelected ? '取消全部选择' : `选择全部 ${accountTotal} 项` }}</NButton><span v-if="selectedAccountIds.length" class="selection-count">已选择 {{ selectedAccountIds.length }} 项</span><NButton v-if="selectedAccountIds.length" type="button" variant="outline" size="xs" :disabled="accountValidationBusy || accountExportBusy" @click="validateSelectedAccounts"><LoaderCircle v-if="accountValidationBusy" :size="15" class="spin" /><ShieldCheck v-else :size="15" />批量验活</NButton><NButton v-if="selectedAccountIds.length" type="button" variant="danger" size="xs" icon-only title="删除选中账号" :disabled="accountValidationBusy || accountExportBusy" @click="openDeleteDialog('accounts')"><Trash2 :size="15" /></NButton></div></template>
+          <template #end><div class="filter-group"><span v-if="accountFilters.relation_label" class="relation-filter"><span :title="accountFilters.relation_label">{{ accountFilters.relation_label }}</span><NButton type="button" variant="outline" size="xs" icon-only title="清除关联筛选" @click="clearAccountRelationFilter"><X :size="14" /></NButton></span><div class="search-field"><Search :size="15" /><NInput id="account-search" name="account-search" v-model="accountFilters.q" size="sm" placeholder="搜索账号、来源或 ID" aria-label="搜索账号" @keyup.enter="searchAccounts" /></div><FilterSelect v-model="accountFilters.has_refresh_token" :options="refreshTokenOptions" size="sm" aria-label="Refresh Token 筛选" @update:model-value="searchAccounts" /><FilterSelect v-model="accountFilters.status" :options="accountStatusOptions" size="sm" aria-label="账号状态筛选" @update:model-value="searchAccounts" /></div></template>
         </ToolbarShell>
         <CalloutBox v-if="accountMessage" :tone="messageTone(accountMessage)" variant="soft" size="sm" class="section-message">{{ accountMessage }}</CalloutBox>
         <TableShell class="data-table accounts-table" :show-empty="!accounts.length" :empty-colspan="8" empty-title="暂无账号" empty-description="导入账号后会显示在这里。" variant="soft" size="sm"><template #head><tr><th class="selection-cell"><NCheckbox :model-value="allAccountsSelected" :indeterminate="selectedAccountsOnPage > 0 && !allAccountsSelected" aria-label="选择当前页账号" @update:model-value="toggleAllAccounts" /></th><th>账号</th><th>关联 CDK</th><th>来源</th><th>凭据</th><th>时间（东八区）</th><th>状态</th><th class="action-cell">操作</th></tr></template><tr v-for="account in accounts" :key="account.id"><td class="selection-cell"><NCheckbox :model-value="selectedAccountIds.includes(account.id)" :aria-label="`选择 ${account.email}`" @update:model-value="toggleAccount(account.id, $event)" /></td><td><b>{{ account.email || '—' }}</b><small>{{ account.account_id || '—' }}</small></td><td class="relation-cell"><button v-if="account.related_cdk" class="relation-code" type="button" :title="`查看 ${cdkLabel(account.related_cdk)}`" @click="openCdkForAccount(account)">{{ cdkLabel(account.related_cdk) }}</button><small v-if="account.related_cdk">任务 {{ account.related_cdk.redemption_id.slice(0, 8) }}</small><span v-else>—</span></td><td>{{ account.source }}</td><td>{{ account.has_access_token ? 'AT' : '' }}{{ account.has_refresh_token ? ' · RT' : '' }}</td><td><b>{{ formatDate(account.delivered_at || account.validated_at) }}</b><small>{{ account.delivered_at ? '交付时间' : '验活时间' }}</small></td><td><StatusPill :label="statusLabel(account.status)" :tone="statusTone(account.status)" size="xs" radius="rounded" /></td><td class="action-cell"><NButton v-if="account.related_cdk" type="button" variant="outline" size="xs" icon-only title="二次导出账号" :disabled="accountExportBusy" @click="reexportAccount(account)"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" /></NButton><span v-else>—</span></td></tr></TableShell>

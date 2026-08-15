@@ -55,6 +55,14 @@ class AccountImportError(Base):
     account_import: Mapped[AccountImport] = relationship(back_populates="errors")
 
 
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class Account(Base):
     __tablename__ = "accounts"
 

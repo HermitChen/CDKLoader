@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -47,3 +47,7 @@ class AccountExportRequest(BaseModel):
 
 class BulkDeleteRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=5000)
+
+
+class SystemSettingsUpdate(BaseModel):
+    values: dict[str, Any] = Field(min_length=1, max_length=64)

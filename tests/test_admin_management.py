@@ -4,7 +4,10 @@ import io
 import zipfile
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.dialects import sqlite
+
 from app.models import Account, CDK, DeliveryItem, Redemption, RedemptionCDK, utcnow
+from app.services.redemption import RedemptionService
 from app.time import china_day_bounds_utc, to_china_iso
 
 from test_workflows import _generate_cdks, _import_accounts
@@ -100,6 +103,47 @@ def test_account_filter_by_refresh_token(client, admin_headers):
     assert without_refresh_token.json()["total"] == 1
     assert without_refresh_token.json()["items"][0]["id"] == without_refresh_token_id
     assert without_refresh_token.json()["items"][0]["has_refresh_token"] is False
+
+
+def test_random_account_selection_honors_filter_and_count(client, admin_headers):
+    _import_accounts(client, admin_headers, count=5)
+    accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"limit": 0},
+    ).json()["items"]
+    available_ids = {account["id"] for account in accounts[:3]}
+
+    with client.app.state.session_factory.begin() as session:
+        for account in accounts:
+            session.get(Account, account["id"]).status = "available" if account["id"] in available_ids else "expired"
+
+    response = client.get(
+        "/api/v1/admin/accounts/random-selection",
+        headers=admin_headers,
+        params={"status": "available", "q": "user-", "count": 2},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total"] == 3
+    assert payload["count"] == 2
+    assert len(payload["ids"]) == 2
+    assert len(set(payload["ids"])) == 2
+    assert set(payload["ids"]) <= available_ids
+    assert set(payload) == {"total", "count", "ids"}
+
+    too_many = client.get(
+        "/api/v1/admin/accounts/random-selection",
+        headers=admin_headers,
+        params={"status": "available", "count": 4},
+    )
+    assert too_many.status_code == 400
+    assert "不能超过当前筛选结果" in too_many.json()["detail"]
+
+
+def test_redemption_account_query_uses_random_order():
+    query = RedemptionService._account_query(CDK(account_source="import", registration_mode="codex"))
+    assert "order by random()" in str(query.compile(dialect=sqlite.dialect())).lower()
 
 
 def test_account_export_only_includes_selected_filtered_accounts(client, admin_headers):
