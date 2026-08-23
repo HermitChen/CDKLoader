@@ -49,6 +49,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
     redelivery_columns = {column["name"] for column in inspector.get_columns("redeliveries")}
     if (
         "code_encrypted" not in cdk_columns
+        or "email_type" not in cdk_columns
         or "proxy_used" not in account_columns
         or "export_file_name" not in redemption_columns
         or "export_file_name" not in redelivery_columns
@@ -56,6 +57,8 @@ def apply_compatibility_migrations(engine: Engine) -> None:
         with engine.begin() as connection:
             if "code_encrypted" not in cdk_columns:
                 connection.execute(text("ALTER TABLE cdks ADD COLUMN code_encrypted TEXT"))
+            if "email_type" not in cdk_columns:
+                connection.execute(text("ALTER TABLE cdks ADD COLUMN email_type VARCHAR(16) DEFAULT 'generic'"))
             if "proxy_used" not in account_columns:
                 connection.execute(text("ALTER TABLE accounts ADD COLUMN proxy_used VARCHAR(1024)"))
             if "export_file_name" not in redemption_columns:

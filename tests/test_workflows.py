@@ -440,6 +440,84 @@ def test_single_json_delivery_defaults_to_cpa_and_sub2api_zip(client, admin_head
         assert names == ["cpa/user-0@example.com.json", "sub2api/user-0@example.com_sub2api.json"]
 
 
+def test_typed_cdks_generate_prefixes_and_deliver_matching_email_accounts(client, admin_headers):
+    records = [
+        {
+            "email": "hotmail-user@hotmail.com",
+            "account_id": "hotmail-account",
+            "access_token": "access-hotmail",
+            "refresh_token": "refresh-hotmail",
+        },
+        {
+            "email": "outlook-user@outlook.cl",
+            "account_id": "outlook-account",
+            "access_token": "access-outlook",
+            "refresh_token": "refresh-outlook",
+        },
+        {
+            "email": "icloud-user@icloud.com",
+            "account_id": "icloud-account",
+            "access_token": "access-icloud",
+            "refresh_token": "refresh-icloud",
+        },
+        {
+            "email": "gmail-user@gmail.com",
+            "account_id": "gmail-account",
+            "access_token": "access-gmail",
+            "refresh_token": "refresh-gmail",
+        },
+        {
+            "email": "other-user@proton.me",
+            "account_id": "other-account",
+            "access_token": "access-other",
+            "refresh_token": "refresh-other",
+        },
+    ]
+    imported = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "true"},
+        files={"file": ("typed-accounts.json", json.dumps(records).encode(), "application/json")},
+    )
+    assert imported.status_code == 200, imported.text
+
+    generated = {}
+    for email_type, quota in (("ms", 2), ("icloud", 1), ("gmail", 1)):
+        response = client.post(
+            "/api/v1/admin/cdks/generate",
+            headers=admin_headers,
+            json={"count": 1, "quota": quota, "email_type": email_type, "export_format": "json"},
+        )
+        assert response.status_code == 200, response.text
+        code = response.json()["codes"][0]
+        expected_prefix = {"ms": "CDK-MS", "icloud": "CDK-IC", "gmail": "CDK-GM"}[email_type]
+        assert code.startswith(f"{expected_prefix}-")
+        assert response.json()["items"][0]["email_type"] == email_type
+        generated[email_type] = code
+
+    for email_type, expected_emails in {
+        "ms": {"hotmail-user@hotmail.com", "outlook-user@outlook.cl"},
+        "icloud": {"icloud-user@icloud.com"},
+        "gmail": {"gmail-user@gmail.com"},
+    }.items():
+        redeemed = client.post(
+            "/api/v1/redemptions",
+            headers={"Idempotency-Key": f"typed-{email_type}", "Prefer": "wait=3"},
+            json={"codes": [generated[email_type]]},
+        )
+        assert redeemed.status_code == 200, redeemed.text
+        assert redeemed.json()["status"] == "completed"
+        assert redeemed.json()["delivered_count"] == len(expected_emails)
+
+        accounts = client.get(
+            "/api/v1/admin/accounts",
+            headers=admin_headers,
+            params={"redemption_id": redeemed.json()["id"], "limit": 0},
+        )
+        assert accounts.status_code == 200, accounts.text
+        assert {item["email"] for item in accounts.json()["items"]} == expected_emails
+
+
 def test_invalid_cdk_does_not_create_delivery(client, admin_headers):
     response = client.post(
         "/api/v1/redemptions",

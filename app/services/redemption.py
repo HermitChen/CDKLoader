@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload, sessionmaker
 from ..models import Account, CDK, DeliveryItem, Redelivery, RedeliveryItem, Redemption, RedemptionCDK, utcnow
 from ..security import SecurityManager
 from ..time import to_china_iso
+from .cdk import cdk_email_condition, effective_cdk_email_type
 from .validator import TokenValidator, persist_validation_result
 
 
@@ -273,6 +274,9 @@ class RedemptionService:
             query = query.where(Account.source == cdk.account_source)
         if cdk.registration_mode:
             query = query.where(Account.registration_mode == cdk.registration_mode)
+        email_condition = cdk_email_condition(Account.email, effective_cdk_email_type(cdk))
+        if email_condition is not None:
+            query = query.where(email_condition)
         return query.order_by(func.random())
 
     def _reserve_accounts(self, redemption_id: str, cdk_id: str, desired: int) -> list[str]:
@@ -469,6 +473,7 @@ def serialize_redemption(
                 "id": relation.cdk.id,
                 "code": cdk_code(relation.cdk),
                 "prefix": relation.cdk.code_prefix,
+                "email_type": effective_cdk_email_type(relation.cdk),
                 "reserved_quantity": relation.reserved_quantity,
                 "debited_quantity": relation.debited_quantity,
             }
@@ -487,6 +492,7 @@ def serialize_redelivery(redelivery: Redelivery, security: SecurityManager) -> d
                 "id": item.cdk_id,
                 "code": None,
                 "prefix": item.cdk_prefix,
+                "email_type": effective_cdk_email_type(item),
                 "account_count": 0,
             },
         )

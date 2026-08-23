@@ -105,6 +105,39 @@ def test_account_filter_by_refresh_token(client, admin_headers):
     assert without_refresh_token.json()["items"][0]["has_refresh_token"] is False
 
 
+def test_account_filter_by_email_type(client, admin_headers):
+    _import_accounts(client, admin_headers, count=5)
+    accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"limit": 0},
+    ).json()["items"]
+    emails = [
+        "hotmail-user@hotmail.com",
+        "outlook-user@outlook.com.gr",
+        "icloud-user@icloud.com",
+        "gmail-user@gmail.com",
+        "generic-user@proton.me",
+    ]
+    with client.app.state.session_factory.begin() as session:
+        for account, email in zip(accounts, emails, strict=True):
+            session.get(Account, account["id"]).email = email
+
+    for email_type, expected_emails in {
+        "ms": {"hotmail-user@hotmail.com", "outlook-user@outlook.com.gr"},
+        "icloud": {"icloud-user@icloud.com"},
+        "gmail": {"gmail-user@gmail.com"},
+        "generic": {"generic-user@proton.me"},
+    }.items():
+        response = client.get(
+            "/api/v1/admin/accounts",
+            headers=admin_headers,
+            params={"email_type": email_type, "limit": 0},
+        )
+        assert response.status_code == 200, response.text
+        assert {item["email"] for item in response.json()["items"]} == expected_emails
+
+
 def test_random_account_selection_honors_filter_and_count(client, admin_headers):
     _import_accounts(client, admin_headers, count=5)
     accounts = client.get(
@@ -283,6 +316,28 @@ def test_cdk_filter_copy_and_bulk_delete_skip_frozen(client, admin_headers):
     assert deleted.status_code == 200, deleted.text
     assert deleted.json()["deleted"] == 1
     assert deleted.json()["skipped"] == [{"id": frozen_id, "reason": "CDK 额度已被冻结"}]
+
+
+def test_cdk_filter_by_email_type(client, admin_headers):
+    generated = {}
+    for email_type in ("generic", "ms", "icloud", "gmail"):
+        response = client.post(
+            "/api/v1/admin/cdks/generate",
+            headers=admin_headers,
+            json={"count": 1, "quota": 1, "email_type": email_type, "export_format": "json"},
+        )
+        assert response.status_code == 200, response.text
+        generated[email_type] = response.json()["items"][0]["id"]
+
+    for email_type, cdk_id in generated.items():
+        response = client.get(
+            "/api/v1/admin/cdks",
+            headers=admin_headers,
+            params={"email_type": email_type, "limit": 0},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["total"] == 1
+        assert response.json()["items"][0]["id"] == cdk_id
 
 
 def test_reissue_legacy_unused_cdk_makes_it_copyable(client, admin_headers):
@@ -499,6 +554,7 @@ def test_full_cdk_search_and_delivery_trace_support_reexport(client, admin_heade
             "id": cdk["id"],
             "code": delivered_code,
             "prefix": cdk["prefix"],
+            "email_type": "generic",
             "reserved_quantity": 1,
             "debited_quantity": 1,
         }

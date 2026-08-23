@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, Response
@@ -32,6 +33,13 @@ from ..schemas import (
     SystemSettingsUpdate,
 )
 from ..security import SecurityManager
+from ..services.cdk import (
+    account_email_condition,
+    cdk_code_prefix,
+    cdk_type_condition,
+    effective_cdk_email_type,
+    infer_cdk_email_type,
+)
 from ..services.import_service import AccountImportService, serialize_import
 from ..services.importers import ImportParseException, ParsedBatch, parse_import_files
 from ..services.exporter import build_account_archive
@@ -54,9 +62,9 @@ router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 CDK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def _generate_cdk() -> str:
+def _generate_cdk(email_type: str = "generic") -> str:
     groups = ["".join(secrets.choice(CDK_ALPHABET) for _ in range(4)) for _ in range(4)]
-    return "CDK-" + "-".join(groups)
+    return cdk_code_prefix(email_type) + "-" + "-".join(groups)
 
 
 def _cdk_code(cdk: CDK, security: SecurityManager | None = None) -> str | None:
@@ -79,6 +87,7 @@ def _serialize_cdk(
         "id": cdk.id,
         "code": _cdk_code(cdk, security),
         "prefix": cdk.code_prefix,
+        "email_type": effective_cdk_email_type(cdk),
         "total_quota": cdk.total_quota,
         "remaining_quota": cdk.remaining_quota,
         "reserved_quota": cdk.reserved_quota,
@@ -102,6 +111,7 @@ def _serialize_account(account: Account, security: SecurityManager) -> dict:
             "id": delivery_item.cdk.id,
             "code": _cdk_code(delivery_item.cdk, security),
             "prefix": delivery_item.cdk.code_prefix,
+            "email_type": effective_cdk_email_type(delivery_item.cdk),
             "redemption_id": delivery_item.redemption_id,
             "delivered_at": to_china_iso(delivery_item.delivered_at),
         }
@@ -418,13 +428,14 @@ def list_accounts(
     security: SecurityManager = Depends(get_security),
     current_status: str | None = Query(default=None, alias="status"),
     has_refresh_token: bool | None = Query(default=None),
+    email_type: Literal["generic", "ms", "icloud", "gmail"] | None = Query(default=None),
     q: str | None = Query(default=None, max_length=320),
     cdk_id: str | None = Query(default=None, max_length=36),
     redemption_id: str | None = Query(default=None, max_length=36),
     limit: int = Query(default=15, ge=0, le=200),
     offset: int = Query(default=0, ge=0),
 ):
-    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id)
+    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id, email_type)
     total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     if limit == 0:
         offset = 0
@@ -441,6 +452,7 @@ def _account_query(
     q: str | None,
     cdk_id: str | None = None,
     redemption_id: str | None = None,
+    email_type: str | None = None,
 ):
     query = select(Account)
     if cdk_id or redemption_id:
@@ -455,6 +467,8 @@ def _account_query(
         query = query.where(Account.refresh_token_encrypted.is_not(None))
     elif has_refresh_token is False:
         query = query.where(Account.refresh_token_encrypted.is_(None))
+    if email_type:
+        query = query.where(account_email_condition(Account.email, email_type))
     if q and (term := q.strip()):
         pattern = f"%{term}%"
         query = query.where(
@@ -474,12 +488,13 @@ def random_select_accounts(
     db: Session = Depends(get_db),
     current_status: str | None = Query(default=None, alias="status"),
     has_refresh_token: bool | None = Query(default=None),
+    email_type: Literal["generic", "ms", "icloud", "gmail"] | None = Query(default=None),
     q: str | None = Query(default=None, max_length=320),
     cdk_id: str | None = Query(default=None, max_length=36),
     redemption_id: str | None = Query(default=None, max_length=36),
     count: int = Query(..., ge=1, le=5000),
 ):
-    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id)
+    query = _account_query(current_status, has_refresh_token, q, cdk_id, redemption_id, email_type)
     total = int(db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     if count > total:
         raise HTTPException(status_code=400, detail=f"随机选择数量不能超过当前筛选结果（{total} 个账号）")
@@ -746,7 +761,7 @@ def generate_cdks(payload: CDKGenerateRequest, db: Session = Depends(get_db), se
     items: list[CDK] = []
     for _ in range(payload.count):
         for _attempt in range(10):
-            code = _generate_cdk()
+            code = _generate_cdk(payload.email_type)
             digest = security.cdk_digest(code)
             if not db.scalar(select(CDK.id).where(CDK.code_hmac == digest)):
                 break
@@ -756,6 +771,7 @@ def generate_cdks(payload: CDKGenerateRequest, db: Session = Depends(get_db), se
             code_hmac=digest,
             code_encrypted=security.encrypt(code),
             code_prefix="-".join(code.split("-")[:2]),
+            email_type=payload.email_type,
             total_quota=payload.quota,
             remaining_quota=payload.quota,
             expires_at=to_utc_naive(payload.expires_at) if payload.expires_at else None,
@@ -788,6 +804,7 @@ def import_cdks(payload: CDKImportRequest, db: Session = Depends(get_db), securi
                 code_hmac=digest,
                 code_encrypted=security.encrypt(code),
                 code_prefix="-".join(code.split("-")[:2])[:16],
+                email_type=infer_cdk_email_type(code),
                 total_quota=payload.quota,
                 remaining_quota=payload.quota,
                 expires_at=to_utc_naive(payload.expires_at) if payload.expires_at else None,
@@ -805,12 +822,15 @@ def list_cdks(
     current_status: str | None = Query(default=None, alias="status"),
     q: str | None = Query(default=None, max_length=64),
     quota: str | None = Query(default=None, max_length=32),
+    email_type: Literal["generic", "ms", "icloud", "gmail"] | None = Query(default=None),
     limit: int = Query(default=15, ge=0, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     query = select(CDK).order_by(CDK.created_at.desc())
     if current_status:
         query = query.where(CDK.status == current_status)
+    if email_type:
+        query = query.where(cdk_type_condition(CDK.email_type, CDK.code_prefix, email_type))
     if q and (term := q.strip().upper()):
         query = query.where(_cdk_search_condition(db, security, term))
     if quota:
@@ -891,7 +911,7 @@ def reissue_cdks(payload: BulkDeleteRequest, db: Session = Depends(get_db), secu
             continue
 
         for _attempt in range(10):
-            code = _generate_cdk()
+            code = _generate_cdk(effective_cdk_email_type(cdk))
             digest = security.cdk_digest(code)
             if not db.scalar(select(CDK.id).where(CDK.code_hmac == digest)):
                 break

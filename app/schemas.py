@@ -16,6 +16,7 @@ class CDKGenerateRequest(BaseModel):
     expires_at: datetime | None = None
     account_source: str | None = Field(default=None, max_length=64)
     registration_mode: str | None = Field(default=None, max_length=32)
+    email_type: Literal["generic", "ms", "icloud", "gmail"] = "generic"
     export_format: Literal["json", "csv", "txt"] = "json"
     export_fields: list[str] = Field(default_factory=list)
 

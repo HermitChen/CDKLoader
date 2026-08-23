@@ -172,6 +172,7 @@ class CDK(Base):
     # authenticated administrator bulk-copy endpoint.
     code_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     code_prefix: Mapped[str] = mapped_column(String(16), index=True)
+    email_type: Mapped[str] = mapped_column(String(16), default="generic", index=True)
     total_quota: Mapped[int] = mapped_column(Integer)
     remaining_quota: Mapped[int] = mapped_column(Integer)
     reserved_quota: Mapped[int] = mapped_column(Integer, default=0)

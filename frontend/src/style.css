@@ -124,7 +124,7 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .action-cell { width: 74px; min-width: 74px; text-align: center; }
 .action-cell .ui-btn { margin: 0 auto; }
 .accounts-table table { min-width: 1060px; }
-.cdks-table table { min-width: 1100px; }
+.cdks-table table { min-width: 1200px; }
 .redemptions-table table { min-width: 980px; }
 .relation-cell { min-width: 124px; }
 .relation-code, .relation-count { display: inline-flex; max-width: 250px; align-items: center; gap: 5px; overflow: hidden; padding: 0; border: 0; border-radius: 0; color: hsl(var(--foreground)); background: transparent; cursor: pointer; font: 600 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; text-overflow: ellipsis; white-space: nowrap; transition: color .16s ease; }
@@ -196,7 +196,7 @@ html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollb
 .preview-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 11px 14px; border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 11px; }
 .preview-summary b { color: hsl(var(--foreground)); font-size: 12px; }
 .preview-surface th, .ui-section-kicker, .ui-section-title { letter-spacing: 0; text-transform: none; }
-.cdk-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.cdk-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .dialog-code-result { display: grid; gap: 10px; border-top: 1px solid hsl(var(--border)); padding-top: 15px; }
 .dialog-code-result > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: hsl(var(--muted-foreground)); font-size: 12px; }
 .dialog-code-result pre { max-height: 220px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
