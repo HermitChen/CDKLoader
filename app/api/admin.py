@@ -34,6 +34,9 @@ from ..schemas import (
 )
 from ..security import SecurityManager
 from ..services.cdk import (
+    CDK_EMAIL_TYPE_GMAIL,
+    CDK_EMAIL_TYPE_ICLOUD,
+    CDK_EMAIL_TYPE_MS,
     account_email_condition,
     cdk_code_prefix,
     cdk_type_condition,
@@ -151,8 +154,33 @@ def login(payload: AdminLoginRequest, request: Request):
 
 @router.get("/dashboard", dependencies=[Depends(require_admin)])
 def dashboard(request: Request, db: Session = Depends(get_db)):
+    provider_email_types = (CDK_EMAIL_TYPE_MS, CDK_EMAIL_TYPE_ICLOUD, CDK_EMAIL_TYPE_GMAIL)
+
     def count_accounts(current_status: str) -> int:
         return int(db.scalar(select(func.count()).select_from(Account).where(Account.status == current_status)) or 0)
+
+    available_by_email_type = {
+        email_type: int(
+            db.scalar(
+                select(func.count())
+                .select_from(Account)
+                .where(Account.status == "available", account_email_condition(Account.email, email_type))
+            )
+            or 0
+        )
+        for email_type in provider_email_types
+    }
+    cdk_remaining_quota_by_email_type = {
+        email_type: int(
+            db.scalar(
+                select(func.coalesce(func.sum(CDK.remaining_quota), 0)).where(
+                    cdk_type_condition(CDK.email_type, CDK.code_prefix, email_type)
+                )
+            )
+            or 0
+        )
+        for email_type in provider_email_types
+    }
 
     day_start, day_end = china_day_bounds_utc()
     return {
@@ -161,8 +189,10 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "reserved": count_accounts("reserved"),
             "quarantined": count_accounts("quarantined"),
             "delivered": count_accounts("delivered"),
+            "available_by_email_type": available_by_email_type,
         },
         "cdk_remaining_quota": int(db.scalar(select(func.coalesce(func.sum(CDK.remaining_quota), 0))) or 0),
+        "cdk_remaining_quota_by_email_type": cdk_remaining_quota_by_email_type,
         "today_redemptions": int(
             db.scalar(
                 select(func.count()).select_from(Redemption).where(Redemption.created_at >= day_start, Redemption.created_at < day_end)

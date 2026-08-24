@@ -481,6 +481,61 @@ def test_today_redemption_filter_excludes_earlier_records(client, admin_headers)
     assert dashboard.json()["today_redemptions"] == 1
 
 
+def test_dashboard_reports_provider_account_and_cdk_inventory(client, admin_headers):
+    with client.app.state.session_factory.begin() as session:
+        session.add_all(
+            [
+                Account(email="available@hotmail.com", account_id="dashboard-ms", status="available"),
+                Account(email="available@icloud.com", account_id="dashboard-icloud", status="available"),
+                Account(email="available@gmail.com", account_id="dashboard-gmail", status="available"),
+                Account(email="reserved@hotmail.com", account_id="dashboard-reserved", status="reserved"),
+                CDK(
+                    code_hmac="dashboard-ms-stored",
+                    code_prefix="CDK-MS",
+                    email_type="ms",
+                    total_quota=8,
+                    remaining_quota=6,
+                ),
+                CDK(
+                    code_hmac="dashboard-ms-legacy",
+                    code_prefix="CDK-MS",
+                    email_type="generic",
+                    total_quota=5,
+                    remaining_quota=4,
+                ),
+                CDK(
+                    code_hmac="dashboard-icloud",
+                    code_prefix="CDK-IC",
+                    email_type="icloud",
+                    total_quota=3,
+                    remaining_quota=2,
+                ),
+                CDK(
+                    code_hmac="dashboard-gmail",
+                    code_prefix="CDK-GM",
+                    email_type="generic",
+                    total_quota=7,
+                    remaining_quota=5,
+                ),
+                CDK(
+                    code_hmac="dashboard-generic",
+                    code_prefix="CDK",
+                    email_type="generic",
+                    total_quota=11,
+                    remaining_quota=10,
+                ),
+            ]
+        )
+
+    response = client.get("/api/v1/admin/dashboard", headers=admin_headers)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["accounts"]["available_by_email_type"] == {"ms": 1, "icloud": 1, "gmail": 1}
+    assert payload["cdk_remaining_quota_by_email_type"] == {"ms": 10, "icloud": 2, "gmail": 5}
+    assert payload["cdk_remaining_quota"] == 27
+
+
 def test_full_cdk_search_and_delivery_trace_support_reexport(client, admin_headers):
     exact_codes = ["CDK-TRACE-AAAA-BBBB-CCCC", "CDK-TRACE-DDDD-EEEE-FFFF"]
     imported = client.post(

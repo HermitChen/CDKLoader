@@ -15,6 +15,7 @@ import {
   LayoutDashboard,
   ListChecks,
   LoaderCircle,
+  Mail,
   LockKeyhole,
   LogOut,
   PackageOpen,
@@ -1509,6 +1510,22 @@ onUnmounted(() => {
           <StatCard label="隔离账号" :value="dashboard?.accounts.quarantined ?? '-'" caption="等待后续确认" icon="lucide:shield-alert" icon-tone="error" />
           <StatCard label="剩余额度" :value="dashboard?.cdk_remaining_quota ?? '-'" caption="全部 CDK" icon="lucide:key-round" icon-tone="info" />
         </div>
+        <FormSection class="provider-panel" title="邮箱类型库存" description="查看各类型可用邮箱和对应 CDK 剩余额度。" variant="outline">
+          <div class="provider-grid">
+            <div class="provider-column">
+              <div class="provider-heading"><span class="provider-icon provider-icon-ms"><Mail :size="16" /></span><strong>微软邮箱</strong></div>
+              <div class="provider-metrics"><div class="provider-metric"><span>可用邮箱</span><strong>{{ dashboard?.accounts?.available_by_email_type?.ms ?? '-' }}</strong></div><div class="provider-metric"><span>剩余额度</span><strong>{{ dashboard?.cdk_remaining_quota_by_email_type?.ms ?? '-' }}</strong></div></div>
+            </div>
+            <div class="provider-column">
+              <div class="provider-heading"><span class="provider-icon provider-icon-icloud"><Mail :size="16" /></span><strong>苹果邮箱</strong></div>
+              <div class="provider-metrics"><div class="provider-metric"><span>可用邮箱</span><strong>{{ dashboard?.accounts?.available_by_email_type?.icloud ?? '-' }}</strong></div><div class="provider-metric"><span>剩余额度</span><strong>{{ dashboard?.cdk_remaining_quota_by_email_type?.icloud ?? '-' }}</strong></div></div>
+            </div>
+            <div class="provider-column">
+              <div class="provider-heading"><span class="provider-icon provider-icon-gmail"><Mail :size="16" /></span><strong>谷歌邮箱</strong></div>
+              <div class="provider-metrics"><div class="provider-metric"><span>可用邮箱</span><strong>{{ dashboard?.accounts?.available_by_email_type?.gmail ?? '-' }}</strong></div><div class="provider-metric"><span>剩余额度</span><strong>{{ dashboard?.cdk_remaining_quota_by_email_type?.gmail ?? '-' }}</strong></div></div>
+            </div>
+          </div>
+        </FormSection>
         <FormSection class="system-panel" title="运行状态" description="当前服务运行配置和今日活动。" variant="outline">
           <div class="system-row"><span class="system-label"><Gauge :size="16" />验活模式</span><StatusPill :label="dashboard?.validation_mode || '—'" tone="info" size="xs" radius="rounded" /><span class="system-divider" aria-hidden="true" /><button class="today-redemptions" type="button" title="查看今日兑换记录" @click="openTodayRedemptions"><span class="system-label">今日兑换</span><strong>{{ dashboard?.today_redemptions ?? '-' }}</strong><ChevronRight :size="15" /></button></div>
         </FormSection>
