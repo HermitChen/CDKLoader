@@ -80,7 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pass
         engine.dispose()
 
-    app = FastAPI(title="CDK Loader", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="ChatGPT账号提取", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved_settings
     app.state.engine = engine
     app.state.session_factory = session_factory
