@@ -112,6 +112,8 @@ CDK_LOADER_IMAGE=ghcr.io/hermitchen/cdkloader:latest
 - `TXT`：每行使用 `email----password----refresh_token` 格式。
 - `ZIP`：批量读取包内的 JSON、CSV 和 TXT 文件；不允许嵌套 ZIP。
 
+CPA JSON 会识别顶层的 `password` 和 `2fa` 字段；Sub2API JSON 会识别 `accounts[].notes` JSON 字符串中的 `mailbox.password` 和 `2fa`。这两种来源的账号导出时会继续同时生成兼容的 CPA 与 Sub2API 文件，并按各自格式写回字段；未带来源格式的历史账号保持原有导出行为。
+
 每条账号至少需要 `email` 或 `account_id`，并至少包含 `access_token` 或 `refresh_token`。重复账号可以选择跳过、补充空字段或替换已有凭据。
 
 ## JSON 交付结构

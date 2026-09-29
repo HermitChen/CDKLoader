@@ -15,6 +15,7 @@ from ..config import Settings
 CANONICAL_FIELDS = {
     "email",
     "password",
+    "two_factor",
     "cookies",
     "client_id",
     "account_id",
@@ -38,6 +39,11 @@ HEADER_ALIASES = {
     "id": "account_id",
     "email": "email",
     "password": "password",
+    "2fa": "two_factor",
+    "twofa": "two_factor",
+    "twofactor": "two_factor",
+    "totp": "two_factor",
+    "otp": "two_factor",
     "clientid": "client_id",
     "accountid": "account_id",
     "workspaceid": "workspace_id",
@@ -63,6 +69,7 @@ class ParsedAccount:
     locator: str
     email: str | None = None
     password: str | None = None
+    two_factor: str | None = None
     cookies: str | None = None
     client_id: str | None = None
     account_id: str | None = None
@@ -76,6 +83,7 @@ class ParsedAccount:
     expires_at: datetime | None = None
     registration_mode: str = "codex"
     source: str = "import"
+    source_format: str = "legacy"
     proxy_used: str | None = None
     extra_data: dict[str, Any] = field(default_factory=dict)
 
@@ -132,23 +140,92 @@ def _normalized_header(header: str) -> str:
     return "".join(char for char in header.lower() if char.isalnum())
 
 
-def _extract_known(data: dict[str, Any], locator: str, source: str) -> ParsedAccount:
-    normalized = {str(key).strip().lower(): value for key, value in data.items()}
+def _canonical_field_name(key: Any) -> str:
+    normalized = str(key).strip().lower()
+    return {
+        "2fa": "two_factor",
+        "twofa": "two_factor",
+        "twofactor": "two_factor",
+        "totp": "two_factor",
+        "otp": "two_factor",
+    }.get(_normalized_header(normalized), normalized)
+
+
+def _normalize_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    return {_canonical_field_name(key): value for key, value in data.items()}
+
+
+def _strip_note_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if _canonical_field_name(key) in {"password", "two_factor"}:
+                continue
+            cleaned[str(key)] = _strip_note_secrets(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_note_secrets(item) for item in value]
+    return value
+
+
+def _parse_sub2api_notes(value: Any) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, None, None
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None
+
+    mailbox = payload.get("mailbox") if isinstance(payload.get("mailbox"), dict) else {}
+    password = _compact(mailbox.get("password")) or _compact(payload.get("password"))
+    two_factor = None
+    for key, item in payload.items():
+        if _canonical_field_name(key) == "two_factor":
+            two_factor = _compact(item)
+            break
+    cleaned = _strip_note_secrets(payload)
+    return password, two_factor, cleaned if isinstance(cleaned, dict) else None
+
+
+def _extract_known(
+    data: dict[str, Any],
+    locator: str,
+    source: str,
+    source_format: str = "legacy",
+) -> ParsedAccount:
+    normalized = _normalize_mapping(data)
     credentials = normalized.get("credentials")
     if isinstance(credentials, dict):
-        credentials = {str(key).strip().lower(): value for key, value in credentials.items()}
+        credentials = _normalize_mapping(credentials)
     else:
         credentials = {}
 
     def value(name: str) -> Any:
         return normalized.get(name, credentials.get(name))
 
-    known = set(CANONICAL_FIELDS) | {"credentials", "type", "name", "platform", "extra", "expired"}
+    note_password, note_two_factor, note_template = _parse_sub2api_notes(normalized.get("notes"))
+    known = set(CANONICAL_FIELDS) | {
+        "credentials",
+        "type",
+        "name",
+        "platform",
+        "extra",
+        "expired",
+        "notes",
+    }
     extra = normalized.get("extra") if isinstance(normalized.get("extra"), dict) else {}
+    password = _compact(value("password")) or note_password
+    two_factor = _compact(value("two_factor")) or note_two_factor
+    extra_data = {key: value for key, value in normalized.items() if key not in known}
+    if note_template is not None:
+        extra_data["sub2api_notes"] = note_template
     account = ParsedAccount(
         locator=locator,
         email=_normalize_email(value("email")),
-        password=_compact(value("password")),
+        password=password,
+        two_factor=two_factor,
         cookies=_compact(value("cookies")),
         client_id=_compact(value("client_id")),
         account_id=_compact(value("account_id")),
@@ -162,8 +239,9 @@ def _extract_known(data: dict[str, Any], locator: str, source: str) -> ParsedAcc
         expires_at=_parse_datetime(value("expires_at") or value("expired"), "expires_at", locator),
         registration_mode=_compact(value("registration_mode") or value("type")) or "codex",
         source=_compact(extra.get("source") if isinstance(extra, dict) else None) or source,
+        source_format=source_format,
         proxy_used=_compact(value("proxy_used") or value("proxy_url") or value("proxy")),
-        extra_data={key: value for key, value in normalized.items() if key not in known},
+        extra_data=extra_data,
     )
     if isinstance(extra, dict):
         account.extra_data.update(extra)
@@ -207,7 +285,14 @@ def _parse_json(filename: str, content: bytes, source_locator: str = "") -> Pars
             batch.errors.append(ParseError(locator, "invalid_record", "账号记录必须是对象"))
             continue
         try:
-            batch.records.append(_extract_known(row, locator, source))
+            batch.records.append(
+                _extract_known(
+                    row,
+                    locator,
+                    source,
+                    source_format=detected if detected in {"cpa", "sub2api"} else "legacy",
+                )
+            )
         except ImportParseException as exc:
             batch.errors.append(ParseError(locator, "invalid_record", str(exc), _normalize_email(row.get("email")) or ""))
     return batch
@@ -259,6 +344,7 @@ def _parse_txt(filename: str, content: bytes, source_locator: str = "") -> Parse
                     {"email": parts[0], "password": parts[1], "refresh_token": parts[2]},
                     locator,
                     "txt",
+                    "legacy",
                 )
             )
         except ImportParseException as exc:

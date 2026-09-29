@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -222,6 +223,123 @@ def test_account_export_only_includes_selected_filtered_accounts(client, admin_h
         f"sub2api/{exported_account['email']}_sub2api.json",
     ]
     assert "manifest.json" not in names
+
+
+def test_source_profile_export_preserves_cpa_and_sub2api_credentials(client, admin_headers):
+    cpa_email = "cpa-profile@example.com"
+    cpa_import = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "false"},
+        files={
+            "file": (
+                "cpa.json",
+                json.dumps(
+                    {
+                        "type": "web",
+                        "email": cpa_email,
+                        "account_id": "cpa-profile-account",
+                        "password": "cpa-password",
+                        "2fa": "cpa-two-factor",
+                        "access_token": "cpa-access",
+                        "refresh_token": "cpa-refresh",
+                    }
+                ).encode(),
+                "application/json",
+            )
+        },
+    )
+    assert cpa_import.status_code == 200, cpa_import.text
+    cpa_account = client.get("/api/v1/admin/accounts", headers=admin_headers).json()["items"][0]
+
+    with client.app.state.session_factory.begin() as session:
+        stored = session.get(Account, cpa_account["id"])
+        assert stored.source_format == "cpa"
+        assert stored.password_encrypted != "cpa-password"
+        assert stored.two_factor_encrypted != "cpa-two-factor"
+
+    cpa_export = client.post(
+        "/api/v1/admin/accounts/export",
+        headers=admin_headers,
+        json={"ids": [cpa_account["id"]]},
+    )
+    assert cpa_export.status_code == 200, cpa_export.text
+    with zipfile.ZipFile(io.BytesIO(cpa_export.content)) as archive:
+        assert archive.namelist() == [
+            f"cpa/{cpa_email}.json",
+            f"sub2api/{cpa_email}_sub2api.json",
+        ]
+        cpa_payload = json.loads(archive.read(f"cpa/{cpa_email}.json"))
+        cpa_sub2api_payload = json.loads(archive.read(f"sub2api/{cpa_email}_sub2api.json"))
+    assert cpa_payload["password"] == "cpa-password"
+    assert cpa_payload["2fa"] == "cpa-two-factor"
+    cpa_sub2api_notes = json.loads(cpa_sub2api_payload["accounts"][0]["notes"])
+    assert cpa_sub2api_notes["mailbox"]["password"] == "cpa-password"
+    assert cpa_sub2api_notes["2fa"] == "cpa-two-factor"
+
+    sub2api_email = "sub2api-profile@example.com"
+    sub2api_notes = json.dumps(
+        {
+            "mailbox": {"bind_email": sub2api_email, "password": "sub2api-password"},
+            "2fa": "sub2api-two-factor",
+        },
+        separators=(",", ":"),
+    )
+    sub2api_import = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "false"},
+        files={
+            "file": (
+                "sub2api.json",
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "name": sub2api_email,
+                                "account_id": "sub2api-profile-account",
+                                "credentials": {
+                                    "email": sub2api_email,
+                                    "access_token": "sub2api-access",
+                                    "refresh_token": "sub2api-refresh",
+                                },
+                                "notes": sub2api_notes,
+                            }
+                        ]
+                    }
+                ).encode(),
+                "application/json",
+            )
+        },
+    )
+    assert sub2api_import.status_code == 200, sub2api_import.text
+    accounts = client.get("/api/v1/admin/accounts", headers=admin_headers).json()["items"]
+    sub2api_account = next(item for item in accounts if item["email"] == sub2api_email)
+
+    with client.app.state.session_factory.begin() as session:
+        stored = session.get(Account, sub2api_account["id"])
+        assert stored.source_format == "sub2api"
+        assert stored.password_encrypted != "sub2api-password"
+        assert stored.two_factor_encrypted != "sub2api-two-factor"
+        assert "password" not in stored.extra_data
+        assert "2fa" not in stored.extra_data
+
+    sub2api_export = client.post(
+        "/api/v1/admin/accounts/export",
+        headers=admin_headers,
+        json={"ids": [sub2api_account["id"]]},
+    )
+    assert sub2api_export.status_code == 200, sub2api_export.text
+    with zipfile.ZipFile(io.BytesIO(sub2api_export.content)) as archive:
+        names = archive.namelist()
+        assert names == [
+            f"cpa/{sub2api_email}.json",
+            f"sub2api/{sub2api_email}_sub2api.json",
+        ]
+        sub2api_payload = json.loads(archive.read(f"sub2api/{sub2api_email}_sub2api.json"))
+    exported_notes = json.loads(sub2api_payload["accounts"][0]["notes"])
+    assert exported_notes["mailbox"]["password"] == "sub2api-password"
+    assert exported_notes["2fa"] == "sub2api-two-factor"
 
 
 def test_account_export_rejects_missing_selected_account(client, admin_headers):

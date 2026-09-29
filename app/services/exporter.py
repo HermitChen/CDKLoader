@@ -7,6 +7,7 @@ import os
 import re
 import zipfile
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from ..time import CHINA_TIMEZONE, as_utc, china_now, to_china_iso
 ALL_EXPORT_FIELDS = {
     "email",
     "password",
+    "two_factor",
     "client_id",
     "account_id",
     "workspace_id",
@@ -169,6 +171,7 @@ def serialize_account(account, security: SecurityManager, fields: list[str]) -> 
         safe_fields = DEFAULT_EXPORT_FIELDS
     encrypted_fields = {
         "password": "password_encrypted",
+        "two_factor": "two_factor_encrypted",
         "access_token": "access_token_encrypted",
         "refresh_token": "refresh_token_encrypted",
         "id_token": "id_token_encrypted",
@@ -207,6 +210,11 @@ def _decrypt(account, security: SecurityManager, field: str) -> str:
         return ""
 
 
+def _account_source_format(account) -> str:
+    source_format = getattr(account, "source_format", None)
+    return source_format if source_format in {"cpa", "sub2api"} else "legacy"
+
+
 def _extra(account) -> dict:
     try:
         value = json.loads(account.extra_data or "{}")
@@ -237,6 +245,8 @@ def _delivery_identity(account, security: SecurityManager) -> dict:
         "refresh_token": _decrypt(account, security, "refresh_token"),
         "id_token": _decrypt(account, security, "id_token"),
         "session_token": _decrypt(account, security, "session_token"),
+        "password": _decrypt(account, security, "password"),
+        "two_factor": _decrypt(account, security, "two_factor"),
         "expires_at": _date_value(account.expires_at) or "",
         "last_refresh": _date_value(account.last_refresh) or "",
         "extra": extra,
@@ -264,54 +274,87 @@ def _render_cpa(account, security: SecurityManager) -> bytes:
             "chatgpt_user_id": values["chatgpt_user_id"],
         },
     }
+    if _account_source_format(account) in {"cpa", "sub2api"}:
+        payload["password"] = values["password"]
+        payload["2fa"] = values["two_factor"]
+        payload = {
+            "type": payload.pop("type"),
+            "email": payload.pop("email"),
+            "password": payload.pop("password"),
+            "2fa": payload.pop("2fa"),
+            **payload,
+        }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def _render_sub2api(account, security: SecurityManager) -> bytes:
+def _render_sub2api_notes(account, values: dict) -> str:
+    template = values["extra"].get("sub2api_notes")
+    notes = deepcopy(template) if isinstance(template, dict) else {}
+    mailbox = notes.get("mailbox") if isinstance(notes.get("mailbox"), dict) else {}
+    mailbox = dict(mailbox)
+    mailbox["bind_email"] = str(mailbox.get("bind_email") or values["email"])
+    mailbox["password"] = values["password"]
+    notes["mailbox"] = mailbox
+    notes["2fa"] = values["two_factor"]
+    return json.dumps(notes, ensure_ascii=False, separators=(",", ":"))
+
+
+def _render_sub2api_account(account, security: SecurityManager) -> dict:
     values = _delivery_identity(account, security)
     extra = values["extra"]
     expires_in = 0
     if account.expires_at:
         expires_in = max(0, int((account.expires_at - utcnow()).total_seconds()))
+    account_payload = {
+        "name": values["email"],
+        "platform": "openai",
+        "type": "oauth",
+        "account_id": values["account_id"],
+        "chatgpt_account_id": values["chatgpt_account_id"],
+        "chatgpt_user_id": values["chatgpt_user_id"],
+        "session_token": values["session_token"],
+        "credentials": {
+            "email": values["email"],
+            "access_token": values["access_token"],
+            "refresh_token": values["refresh_token"],
+            "id_token": values["id_token"],
+            "session_token": values["session_token"],
+            "client_id": values["client_id"],
+            "chatgpt_account_id": values["chatgpt_account_id"],
+            "chatgpt_user_id": values["chatgpt_user_id"],
+            "organization_id": values["organization_id"],
+            "expires_at": values["expires_at"],
+            "expires_in": expires_in,
+            "model_mapping": extra.get("model_mapping") if isinstance(extra.get("model_mapping"), dict) else {},
+            "plan_type": str(extra.get("plan_type") or ""),
+        },
+        "extra": {
+            "email": values["email"],
+            "auth_provider": str(extra.get("auth_provider") or "platform"),
+            "source": account.source,
+            "plan_type": str(extra.get("plan_type") or ""),
+        },
+        "concurrency": _number(extra.get("concurrency"), 10),
+        "priority": _number(extra.get("priority"), 1),
+        "rate_multiplier": _number(extra.get("rate_multiplier"), 1),
+        "auto_pause_on_expired": bool(extra.get("auto_pause_on_expired", True)),
+    }
+    if _account_source_format(account) in {"cpa", "sub2api"}:
+        account_payload["notes"] = _render_sub2api_notes(account, values)
+    return account_payload
+
+
+def _render_sub2api_accounts(accounts: list[Account], security: SecurityManager) -> bytes:
     payload = {
         "exported_at": china_now().isoformat(timespec="milliseconds"),
         "proxies": [],
-        "accounts": [{
-            "name": values["email"],
-            "platform": "openai",
-            "type": "oauth",
-            "account_id": values["account_id"],
-            "chatgpt_account_id": values["chatgpt_account_id"],
-            "chatgpt_user_id": values["chatgpt_user_id"],
-            "session_token": values["session_token"],
-            "credentials": {
-                "email": values["email"],
-                "access_token": values["access_token"],
-                "refresh_token": values["refresh_token"],
-                "id_token": values["id_token"],
-                "session_token": values["session_token"],
-                "client_id": values["client_id"],
-                "chatgpt_account_id": values["chatgpt_account_id"],
-                "chatgpt_user_id": values["chatgpt_user_id"],
-                "organization_id": values["organization_id"],
-                "expires_at": values["expires_at"],
-                "expires_in": expires_in,
-                "model_mapping": extra.get("model_mapping") if isinstance(extra.get("model_mapping"), dict) else {},
-                "plan_type": str(extra.get("plan_type") or ""),
-            },
-            "extra": {
-                "email": values["email"],
-                "auth_provider": str(extra.get("auth_provider") or "platform"),
-                "source": account.source,
-                "plan_type": str(extra.get("plan_type") or ""),
-            },
-            "concurrency": _number(extra.get("concurrency"), 10),
-            "priority": _number(extra.get("priority"), 1),
-            "rate_multiplier": _number(extra.get("rate_multiplier"), 1),
-            "auto_pause_on_expired": bool(extra.get("auto_pause_on_expired", True)),
-        }],
+        "accounts": [_render_sub2api_account(account, security) for account in accounts],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _render_sub2api(account, security: SecurityManager) -> bytes:
+    return _render_sub2api_accounts([account], security)
 
 
 def _archive_stem(account, index: int, used: set[str]) -> str:
@@ -330,6 +373,18 @@ def _timestamped_zip_filename() -> str:
     return f"accounts_{china_now().strftime('%Y%m%d_%H%M%S')}.zip"
 
 
+def _write_source_profile_entries(
+    archive: zipfile.ZipFile,
+    accounts: list[Account],
+    security: SecurityManager,
+    used_stems: set[str],
+) -> None:
+    for index, account in enumerate(accounts, start=1):
+        stem = _archive_stem(account, index, used_stems)
+        archive.writestr(f"cpa/{stem}.json", _render_cpa(account, security))
+        archive.writestr(f"sub2api/{stem}_sub2api.json", _render_sub2api(account, security))
+
+
 def build_account_archive(
     accounts: list[Account],
     security: SecurityManager,
@@ -338,12 +393,12 @@ def build_account_archive(
     buffer = io.BytesIO()
     used_stems: set[str] = set()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for index, account in enumerate(accounts, start=1):
-            stem = _archive_stem(account, index, used_stems)
-            cpa_name = f"cpa/{stem}.json"
-            sub2api_name = f"sub2api/{stem}_sub2api.json"
-            archive.writestr(cpa_name, _render_cpa(account, security))
-            archive.writestr(sub2api_name, _render_sub2api(account, security))
+        _write_source_profile_entries(
+            archive,
+            accounts,
+            security,
+            used_stems,
+        )
         for filename, content in additional_files or []:
             archive.writestr(filename, content)
     return buffer.getvalue(), _timestamped_zip_filename(), "application/zip"
@@ -374,13 +429,13 @@ def build_delivery_archive_to_path(
         for cdk_id, settings in sorted(cdk_settings.items(), key=lambda item: item[1].ordinal):
             cdk_deliveries = deliveries_by_cdk[cdk_id]
             if settings.export_format == "json":
-                for index, delivery in enumerate(cdk_deliveries, start=1):
-                    stem = _archive_stem(delivery.account, index, used_stems)
-                    archive.writestr(f"cpa/{stem}.json", _render_cpa(delivery.account, security))
-                    archive.writestr(
-                        f"sub2api/{stem}_sub2api.json",
-                        _render_sub2api(delivery.account, security),
-                    )
+                _write_source_profile_entries(
+                    archive,
+                    [delivery.account for delivery in cdk_deliveries],
+                    security,
+                    used_stems,
+                )
+                for _ in cdk_deliveries:
                     processed += 1
                     if on_progress:
                         on_progress(processed, total)

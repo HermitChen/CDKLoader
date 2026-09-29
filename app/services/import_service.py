@@ -121,6 +121,7 @@ class AccountImportService:
         apply("registration_mode", record.registration_mode)
         apply("proxy_used", record.proxy_used)
         apply("password", record.password, encrypted=True)
+        apply("two_factor", record.two_factor, encrypted=True)
         apply("access_token", record.access_token, encrypted=True)
         apply("refresh_token", record.refresh_token, encrypted=True)
         apply("id_token", record.id_token, encrypted=True)
@@ -129,6 +130,12 @@ class AccountImportService:
         apply("registered_at", record.registered_at)
         apply("last_refresh", record.last_refresh)
         apply("expires_at", record.expires_at)
+        if record.source_format != "legacy":
+            current_format = getattr(account, "source_format", None) or "legacy"
+            if mode == "replace" or current_format == "legacy":
+                if current_format != record.source_format:
+                    account.source_format = record.source_format
+                    changed = True
         if record.extra_data:
             current_extra = json.loads(account.extra_data or "{}")
             merged = {**current_extra, **record.extra_data}
@@ -144,6 +151,7 @@ class AccountImportService:
             import_id=import_id,
             status="pending_validation",
             source=record.source,
+            source_format=record.source_format,
             registration_mode=record.registration_mode,
         )
         self._apply_record(account, record, mode="replace")

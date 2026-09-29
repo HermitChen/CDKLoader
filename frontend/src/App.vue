@@ -10,7 +10,6 @@ import {
   Download,
   FileUp,
   Gauge,
-  Github,
   KeyRound,
   LayoutDashboard,
   ListChecks,
@@ -51,7 +50,6 @@ import {
 import { adminHeaders, ApiError, download, request, requestWithMeta, triggerDownload } from './api'
 
 const isAdmin = ref(window.location.pathname.startsWith('/admin'))
-const currentYear = new Date().getFullYear()
 const adminToken = ref(localStorage.getItem('cdk_loader_admin_token') || '')
 const loginPassword = ref('')
 const loginError = ref('')
@@ -1440,10 +1438,9 @@ onUnmounted(() => {
 <template>
   <div v-if="!isAdmin" class="public-page">
     <main class="redeem-shell">
-      <div class="redeem-brand"><span class="brand-icon"><KeyRound :size="17" /></span><span>CDK Loader</span></div>
+      <div class="redeem-brand"><span class="brand-icon"><KeyRound :size="17" /></span><span>CDK兑换提取</span></div>
       <section class="redeem-title" aria-labelledby="redeem-heading">
-        <p class="eyebrow">PUBLIC EXTRACTION</p>
-        <h1 id="redeem-heading">CDK 文件提取</h1>
+        <h1 id="redeem-heading">ChatGPT账号提取</h1>
         <p>输入有效提取码，验证通过后获取账号文件。</p>
       </section>
 
@@ -1459,12 +1456,6 @@ onUnmounted(() => {
         <NButton class="redeem-action" type="button" variant="primary" size="md" block :disabled="!publicCodes.length || redeemBusy" @click="redeem"><CloudDownload v-if="!redeemBusy" :size="17" /><LoaderCircle v-else :size="17" class="spin" />{{ redeemBusy ? '处理中' : '下载 JSON 包' }}</NButton>
       </FormSection>
     </main>
-    <footer class="public-footer">
-      <span>&copy; {{ currentYear }} CDK Loader. All rights reserved.</span>
-      <a href="https://github.com/HermitChen/CDKLoader" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 CDK Loader" title="GitHub">
-        <Github :size="17" />
-      </a>
-    </footer>
   </div>
 
   <main v-else-if="!adminToken" class="admin-login">

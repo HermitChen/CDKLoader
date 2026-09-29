@@ -87,3 +87,60 @@ def test_cpa_proxy_url_is_stored_as_account_proxy(settings):
     )
 
     assert batch.records[0].proxy_used == "http://account-proxy.example:8080"
+
+
+def test_cpa_and_sub2api_credentials_are_normalized(settings):
+    cpa = parse_import_file(
+        "account.json",
+        json.dumps(
+            {
+                "type": "web",
+                "email": "cpa@example.com",
+                "password": "cpa-password",
+                "2fa": "cpa-two-factor",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+            }
+        ).encode(),
+        settings,
+    )
+    assert cpa.detected_format == "cpa"
+    assert cpa.records[0].source_format == "cpa"
+    assert cpa.records[0].password == "cpa-password"
+    assert cpa.records[0].two_factor == "cpa-two-factor"
+    assert "two_factor" not in cpa.records[0].extra_data
+
+    notes = json.dumps(
+        {
+            "mailbox": {"bind_email": "sub2api@example.com", "password": "sub2api-password"},
+            "2fa": "sub2api-two-factor",
+        },
+        separators=(",", ":"),
+    )
+    sub2api = parse_import_file(
+        "sub2api.json",
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "name": "sub2api@example.com",
+                        "account_id": "sub2api-account",
+                        "credentials": {
+                            "email": "sub2api@example.com",
+                            "access_token": "access-token",
+                            "refresh_token": "refresh-token",
+                        },
+                        "notes": notes,
+                    }
+                ]
+            }
+        ).encode(),
+        settings,
+    )
+    assert sub2api.detected_format == "sub2api"
+    assert sub2api.records[0].source_format == "sub2api"
+    assert sub2api.records[0].password == "sub2api-password"
+    assert sub2api.records[0].two_factor == "sub2api-two-factor"
+    assert sub2api.records[0].extra_data["sub2api_notes"] == {
+        "mailbox": {"bind_email": "sub2api@example.com"}
+    }

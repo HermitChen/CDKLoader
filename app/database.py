@@ -51,6 +51,8 @@ def apply_compatibility_migrations(engine: Engine) -> None:
         "code_encrypted" not in cdk_columns
         or "email_type" not in cdk_columns
         or "proxy_used" not in account_columns
+        or "source_format" not in account_columns
+        or "two_factor_encrypted" not in account_columns
         or "export_file_name" not in redemption_columns
         or "export_file_name" not in redelivery_columns
     ):
@@ -61,6 +63,10 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 connection.execute(text("ALTER TABLE cdks ADD COLUMN email_type VARCHAR(16) DEFAULT 'generic'"))
             if "proxy_used" not in account_columns:
                 connection.execute(text("ALTER TABLE accounts ADD COLUMN proxy_used VARCHAR(1024)"))
+            if "source_format" not in account_columns:
+                connection.execute(text("ALTER TABLE accounts ADD COLUMN source_format VARCHAR(32) DEFAULT 'legacy'"))
+            if "two_factor_encrypted" not in account_columns:
+                connection.execute(text("ALTER TABLE accounts ADD COLUMN two_factor_encrypted TEXT"))
             if "export_file_name" not in redemption_columns:
                 connection.execute(text("ALTER TABLE redemptions ADD COLUMN export_file_name VARCHAR(255)"))
             if "export_file_name" not in redelivery_columns:

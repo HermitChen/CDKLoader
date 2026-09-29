@@ -7,7 +7,7 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path
 
-from app.models import Redelivery, Redemption, utcnow
+from app.models import Account, Redelivery, Redemption, utcnow
 
 
 def _import_accounts(client, admin_headers, count: int = 1):
@@ -438,6 +438,111 @@ def test_single_json_delivery_defaults_to_cpa_and_sub2api_zip(client, admin_head
     with zipfile.ZipFile(io.BytesIO(result.content)) as archive:
         names = archive.namelist()
         assert names == ["cpa/user-0@example.com.json", "sub2api/user-0@example.com_sub2api.json"]
+
+
+def test_json_delivery_replays_cpa_and_sub2api_source_profiles(client, admin_headers):
+    cpa_email = "delivery-cpa@example.com"
+    sub2api_email = "delivery-sub2api@example.com"
+    notes = json.dumps(
+        {
+            "mailbox": {"bind_email": sub2api_email, "password": "sub2api-password"},
+            "2fa": "sub2api-two-factor",
+        },
+        separators=(",", ":"),
+    )
+    files = [
+        (
+            "file",
+            (
+                "cpa.json",
+                json.dumps(
+                    {
+                        "type": "web",
+                        "email": cpa_email,
+                        "account_id": "delivery-cpa-account",
+                        "password": "cpa-password",
+                        "2fa": "cpa-two-factor",
+                        "access_token": "cpa-access",
+                        "refresh_token": "cpa-refresh",
+                    }
+                ).encode(),
+                "application/json",
+            ),
+        ),
+        (
+            "file",
+            (
+                "sub2api.json",
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "name": sub2api_email,
+                                "account_id": "delivery-sub2api-account",
+                                "credentials": {
+                                    "email": sub2api_email,
+                                    "access_token": "sub2api-access",
+                                    "refresh_token": "sub2api-refresh",
+                                },
+                                "notes": notes,
+                            }
+                        ]
+                    }
+                ).encode(),
+                "application/json",
+            ),
+        ),
+    ]
+    imported = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "false"},
+        files=files,
+    )
+    assert imported.status_code == 200, imported.text
+
+    with client.app.state.session_factory.begin() as session:
+        for email in (cpa_email, sub2api_email):
+            account = session.query(Account).filter(Account.email == email).one()
+            account.status = "available"
+
+    generated = client.post(
+        "/api/v1/admin/cdks/generate",
+        headers=admin_headers,
+        json={"count": 1, "quota": 2, "export_format": "json"},
+    )
+    assert generated.status_code == 200, generated.text
+    redeemed = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "source-profile-delivery", "Prefer": "wait=3"},
+        json={"codes": generated.json()["codes"]},
+    )
+    assert redeemed.status_code == 200, redeemed.text
+    body = redeemed.json()
+
+    downloaded = client.get(
+        f"/api/v1/redemptions/{body['id']}/download",
+        params={"token": body["task_token"]},
+    )
+    assert downloaded.status_code == 200, downloaded.text
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        names = archive.namelist()
+        cpa_names = [name for name in names if name.startswith("cpa/")]
+        sub2api_names = [name for name in names if name.startswith("sub2api/")]
+        assert len(cpa_names) == 2
+        assert len(sub2api_names) == 2
+        cpa_payloads = [json.loads(archive.read(name)) for name in cpa_names]
+        sub2api_payloads = [json.loads(archive.read(name)) for name in sub2api_names]
+
+    cpa_payload = next(payload for payload in cpa_payloads if payload["email"] == cpa_email)
+    assert cpa_payload["password"] == "cpa-password"
+    assert cpa_payload["2fa"] == "cpa-two-factor"
+    sub2api_payload = next(
+        payload for payload in sub2api_payloads if payload["accounts"][0]["name"] == sub2api_email
+    )
+    exported_notes = json.loads(sub2api_payload["accounts"][0]["notes"])
+    assert exported_notes["mailbox"]["password"] == "sub2api-password"
+    assert exported_notes["2fa"] == "sub2api-two-factor"
 
 
 def test_typed_cdks_generate_prefixes_and_deliver_matching_email_accounts(client, admin_headers):
