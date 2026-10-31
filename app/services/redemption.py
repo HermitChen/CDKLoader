@@ -269,7 +269,7 @@ class RedemptionService:
 
     @staticmethod
     def _account_query(cdk: CDK):
-        query = select(Account).where(Account.status == "available")
+        query = select(Account).where(Account.status.in_({"available", "quarantined"}))
         if cdk.account_source:
             query = query.where(Account.source == cdk.account_source)
         if cdk.registration_mode:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import zipfile
 from datetime import timedelta
 
 from app.models import OperationLog, OperationTask, utcnow
 from app.services.operations import cleanup_operation_data, export_directory
+from app.services.validator import ValidationResult
 
 
 def _import_accounts(client, admin_headers, count: int = 1):
@@ -63,6 +65,36 @@ def test_manual_validation_exposes_progress_task_without_changing_response_body(
     assert logs.status_code == 200
     assert logs.json()["total"] >= 4
     assert any(item["outcome"] == "valid" for item in logs.json()["items"])
+
+
+def test_manual_validation_runs_accounts_in_parallel(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers, count=2)
+    accounts = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"limit": 0},
+    ).json()["items"]
+    validator = client.app.state.validator
+    barrier = threading.Barrier(2, timeout=2)
+
+    def validate_in_parallel(_account, **_kwargs):
+        barrier.wait()
+        return ValidationResult("valid", message="parallel test")
+
+    monkeypatch.setattr(validator, "validate", validate_in_parallel)
+    response = client.post(
+        "/api/v1/admin/accounts/validate",
+        headers=admin_headers,
+        json={"ids": [item["id"] for item in accounts]},
+    )
+
+    assert response.status_code == 200, response.text
+    task_id = response.headers["x-operation-task-id"]
+    task = client.get(f"/api/v1/admin/operation-tasks/{task_id}", headers=admin_headers)
+    assert task.status_code == 200
+    assert task.json()["status"] == "completed"
+    assert task.json()["valid_count"] == 2
+    assert task.json()["failed_count"] == 0
 
 
 def test_public_export_task_reports_progress_and_supports_range_download(client, admin_headers):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -56,7 +57,7 @@ from ..services.operations import (
 )
 from ..services.redemption import refresh_cdk_status, serialize_redemption
 from ..services.system_settings import settings_payload, update_system_settings
-from ..services.validator import apply_validation, validation_result_details
+from ..services.validator import ValidationResult, persist_validation_result, validation_result_details
 from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
 
 
@@ -611,77 +612,82 @@ def _validate_accounts_task(
             details={"total": task.total},
         )
 
-    for account_id in account_ids:
+    def validate_one(account_id: str) -> tuple[str, ValidationResult | None, str, str | None]:
         try:
+            with factory() as session:
+                account = session.get(Account, account_id)
+                if not account:
+                    return account_id, None, "missing", None
+                if account.status in {"reserved", "delivered"}:
+                    return account_id, None, "unavailable", account.status
+                session.expunge(account)
+
+            result = validator.validate(
+                account,
+                validation_proxy=validation_proxy,
+                probe_mode=probe_mode,
+            )
+            with factory.begin() as session:
+                current = session.get(Account, account_id)
+                if not current or current.status in {"reserved", "delivered"}:
+                    return account_id, None, "unavailable", current.status if current else None
+                persist_validation_result(session, current, validator, result)
+            return account_id, result, "validated", None
+        except Exception:
+            return account_id, None, "failed", None
+
+    workers = min(
+        max(1, int(getattr(validator.settings, "validation_concurrency", 1))),
+        max(1, len(account_ids)),
+    )
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="manual-validate") as executor:
+        for account_id, result, outcome, skipped_status in executor.map(validate_one, account_ids):
             with factory.begin() as session:
                 task = session.get(OperationTask, task_id)
                 if not task or task.status != "running":
                     return
-                account = session.get(Account, account_id)
-                if not account:
-                    task.processed += 1
+                task.processed += 1
+                if outcome in {"missing", "unavailable"}:
                     task.skipped_count += 1
+                    message = "账号不存在" if outcome == "missing" else "账号状态不允许验活"
+                    details = None
+                    if outcome == "unavailable":
+                        details = {"status": skipped_status or "unknown"}
                     add_operation_log(
                         session,
                         operation_type="manual_validation",
                         outcome="skipped",
                         task_id=task_id,
                         account_id=account_id,
-                        message="账号不存在",
+                        message=message,
+                        details=details,
                     )
-                    continue
-                if account.status in {"reserved", "delivered"}:
-                    task.processed += 1
-                    task.skipped_count += 1
+                elif outcome == "failed":
+                    task.failed_count += 1
                     add_operation_log(
                         session,
                         operation_type="manual_validation",
-                        outcome="skipped",
+                        outcome="failed",
                         task_id=task_id,
-                        account_id=account.id,
-                        message="账号状态不允许验活",
-                        details={"status": account.status},
+                        account_id=account_id,
+                        message="验活执行异常",
                     )
-                    continue
-
-                result = apply_validation(
-                    session,
-                    account,
-                    validator,
-                    validation_proxy=validation_proxy,
-                    probe_mode=probe_mode,
-                )
-                task.processed += 1
-                if result.outcome == "valid":
-                    task.valid_count += 1
-                elif result.outcome == "invalid":
-                    task.invalid_count += 1
-                else:
-                    task.inconclusive_count += 1
-                add_operation_log(
-                    session,
-                    operation_type="manual_validation",
-                    outcome=result.outcome,
-                    task_id=task_id,
-                    account_id=account.id,
-                    message=result.message or f"验活结果：{result.outcome}",
-                    details=validation_result_details(result),
-                )
-        except Exception:
-            with factory.begin() as session:
-                task = session.get(OperationTask, task_id)
-                if not task or task.status != "running":
-                    return
-                task.processed += 1
-                task.failed_count += 1
-                add_operation_log(
-                    session,
-                    operation_type="manual_validation",
-                    outcome="failed",
-                    task_id=task_id,
-                    account_id=account_id,
-                    message="验活执行异常",
-                )
+                elif result:
+                    if result.outcome == "valid":
+                        task.valid_count += 1
+                    elif result.outcome == "invalid":
+                        task.invalid_count += 1
+                    else:
+                        task.inconclusive_count += 1
+                    add_operation_log(
+                        session,
+                        operation_type="manual_validation",
+                        outcome=result.outcome,
+                        task_id=task_id,
+                        account_id=account_id,
+                        message=result.message or f"验活结果：{result.outcome}",
+                        details=validation_result_details(result),
+                    )
 
     with factory.begin() as session:
         task = session.get(OperationTask, task_id)

@@ -3,11 +3,13 @@ from __future__ import annotations
 import io
 import json
 import re
+import threading
 import zipfile
 from datetime import timedelta
 from pathlib import Path
 
 from app.models import Account, Redelivery, Redemption, utcnow
+from app.services.validator import ValidationResult
 
 
 def _import_accounts(client, admin_headers, count: int = 1):
@@ -73,6 +75,40 @@ def test_import_preview_encrypts_credentials_and_preserves_duplicate_policy(clie
     accounts = client.get("/api/v1/admin/accounts", headers=admin_headers).json()
     assert accounts["total"] == 1
     assert accounts["items"][0]["status"] == "pending_validation"
+
+
+def test_import_prevalidation_runs_accounts_in_parallel(client, admin_headers, monkeypatch):
+    validator = client.app.state.validator
+    barrier = threading.Barrier(2, timeout=2)
+
+    def validate_in_parallel(_account, **_kwargs):
+        barrier.wait()
+        return ValidationResult("valid", message="parallel test")
+
+    monkeypatch.setattr(validator, "validate", validate_in_parallel)
+    records = [
+        {
+            "email": f"parallel-import-{index}@example.com",
+            "account_id": f"parallel-import-{index}",
+            "access_token": f"parallel-access-{index}",
+        }
+        for index in range(2)
+    ]
+    response = client.post(
+        "/api/v1/admin/account-imports",
+        headers=admin_headers,
+        data={"duplicate_strategy": "skip", "prevalidate": "true"},
+        files={"file": ("parallel-import.json", json.dumps(records).encode(), "application/json")},
+    )
+
+    assert response.status_code == 200, response.text
+    body = client.get(
+        f"/api/v1/admin/account-imports/{response.json()['id']}",
+        headers=admin_headers,
+    ).json()
+    assert body["status"] == "completed"
+    assert body["valid_count"] == 2
+    assert body["failed_count"] == 0
 
 
 def test_import_accepts_multiple_json_files(client, admin_headers):
@@ -186,6 +222,43 @@ def test_multi_cdk_redemption_delivers_zip_once(client, admin_headers):
         params={"token": body["task_token"]},
     )
     assert duplicate_download.status_code == 410
+
+
+def test_quarantined_account_is_revalidated_for_public_redemption(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers)
+    account = client.get(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        params={"limit": 0},
+    ).json()["items"][0]
+    account_id = account["id"]
+
+    with client.app.state.session_factory.begin() as session:
+        session.get(Account, account_id).status = "quarantined"
+
+    validator = client.app.state.validator
+    original_validate = validator.validate
+    validated_ids: list[str] = []
+
+    def record_validation(candidate):
+        validated_ids.append(candidate.id)
+        return original_validate(candidate)
+
+    monkeypatch.setattr(validator, "validate", record_validation)
+    code = _generate_cdks(client, admin_headers, count=1)[0]
+    redemption = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "quarantined-account-redemption", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+
+    assert redemption.status_code == 200, redemption.text
+    assert redemption.json()["status"] == "completed"
+    assert redemption.json()["delivered_count"] == 1
+    assert validated_ids == [account_id]
+
+    with client.app.state.session_factory() as session:
+        assert session.get(Account, account_id).status == "delivered"
 
 
 def test_redeemed_cdk_redelivers_only_its_accounts_without_validation(client, admin_headers, monkeypatch):

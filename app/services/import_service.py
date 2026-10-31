@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -14,7 +15,7 @@ from ..security import SecurityManager, mask_email, token_hint
 from ..time import to_china_iso
 from .importers import ParseError, ParsedAccount, ParsedBatch
 from .operations import add_operation_log, complete_operation_task, start_operation_task
-from .validator import TokenValidator, apply_validation, validation_result_details
+from .validator import TokenValidator, ValidationResult, persist_validation_result, validation_result_details
 
 
 @dataclass
@@ -255,16 +256,38 @@ class AccountImportService:
                     message="导入后的预验活任务开始执行",
                     details={"total": task.total},
                 )
-        for account_id in account_ids:
+
+        def validate_one(account_id: str) -> tuple[str, ValidationResult | None, str]:
             try:
-                with factory.begin() as session:
+                with factory() as session:
                     account = session.get(Account, account_id)
-                    task = session.get(OperationTask, task_id) if task_id else None
-                    if task_id and (not task or task.status != "running"):
-                        return
                     if not account or account.status in {"delivered", "reserved"}:
-                        if task:
-                            task.processed += 1
+                        return account_id, None, "skipped"
+                    session.expunge(account)
+
+                result = self.validator.validate(account)
+                with factory.begin() as session:
+                    current = session.get(Account, account_id)
+                    if not current or current.status in {"delivered", "reserved"}:
+                        return account_id, None, "skipped"
+                    persist_validation_result(session, current, self.validator, result)
+                return account_id, result, "validated"
+            except Exception:
+                return account_id, None, "failed"
+
+        workers = min(
+            max(1, int(getattr(self.validator.settings, "validation_concurrency", 1))),
+            max(1, len(account_ids)),
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="import-validate") as executor:
+            for account_id, result, outcome in executor.map(validate_one, account_ids):
+                if task_id:
+                    with factory.begin() as session:
+                        task = session.get(OperationTask, task_id)
+                        if not task or task.status != "running":
+                            return
+                        task.processed += 1
+                        if outcome == "skipped":
                             task.skipped_count += 1
                             add_operation_log(
                                 session,
@@ -275,50 +298,43 @@ class AccountImportService:
                                 account_id=account_id,
                                 message="账号在预验活前已不可用",
                             )
-                        continue
-                    result = apply_validation(session, account, self.validator)
-                    if result.outcome == "valid":
-                        valid_count += 1
-                    elif result.outcome == "invalid":
-                        invalid_count += 1
-                    else:
-                        inconclusive_count += 1
-                    if task:
-                        task.processed += 1
-                        if result.outcome == "valid":
-                            task.valid_count += 1
-                        elif result.outcome == "invalid":
-                            task.invalid_count += 1
-                        else:
-                            task.inconclusive_count += 1
-                        add_operation_log(
-                            session,
-                            operation_type="account_import_validation",
-                            outcome=result.outcome,
-                            task_id=task_id,
-                            resource_id=import_id,
-                            account_id=account.id,
-                            message=result.message or f"验活结果：{result.outcome}",
-                            details=validation_result_details(result),
-                        )
-            except Exception:
-                if not task_id:
+                        elif outcome == "failed":
+                            task.failed_count += 1
+                            add_operation_log(
+                                session,
+                                operation_type="account_import_validation",
+                                outcome="failed",
+                                task_id=task_id,
+                                resource_id=import_id,
+                                account_id=account_id,
+                                message="预验活执行异常",
+                            )
+                        elif result:
+                            if result.outcome == "valid":
+                                task.valid_count += 1
+                            elif result.outcome == "invalid":
+                                task.invalid_count += 1
+                            else:
+                                task.inconclusive_count += 1
+                            add_operation_log(
+                                session,
+                                operation_type="account_import_validation",
+                                outcome=result.outcome,
+                                task_id=task_id,
+                                resource_id=import_id,
+                                account_id=account_id,
+                                message=result.message or f"验活结果：{result.outcome}",
+                                details=validation_result_details(result),
+                            )
+
+                if outcome != "validated" or not result:
                     continue
-                with factory.begin() as session:
-                    task = session.get(OperationTask, task_id)
-                    if not task or task.status != "running":
-                        return
-                    task.processed += 1
-                    task.failed_count += 1
-                    add_operation_log(
-                        session,
-                        operation_type="account_import_validation",
-                        outcome="failed",
-                        task_id=task_id,
-                        resource_id=import_id,
-                        account_id=account_id,
-                        message="预验活执行异常",
-                    )
+                if result.outcome == "valid":
+                    valid_count += 1
+                elif result.outcome == "invalid":
+                    invalid_count += 1
+                else:
+                    inconclusive_count += 1
 
         with factory.begin() as session:
             account_import = session.get(AccountImport, import_id)
