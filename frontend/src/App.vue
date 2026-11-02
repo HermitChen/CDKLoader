@@ -496,7 +496,7 @@ async function refreshAdminTask(taskId) {
     if (task.status === 'completed' || task.status === 'failed') {
       stopAdminTaskPolling()
       accountMessage.value = task.status === 'completed'
-        ? `验活完成：${task.processed}/${task.total}，有效 ${task.valid_count}，无效 ${task.invalid_count}，待确认 ${task.inconclusive_count}。`
+        ? `验活完成：${task.processed}/${task.total}，有效 ${task.valid_count}，无效 ${task.invalid_count}，待确认 ${task.inconclusive_count}，RT 恢复 ${task.recoverable_count}。`
         : `验活任务失败：${task.error_message || '请查看任务日志。'}`
       scheduleAdminTaskMessageClear()
       await Promise.all([loadAccounts(), loadOperationTasks(), loadOperationLogs()])
@@ -1581,7 +1581,7 @@ onUnmounted(() => {
               <td><button class="task-detail-link" type="button" title="查看任务详情" @click="openOperationTask(task)"><b>{{ task.id.slice(0, 8) }}</b><small>{{ task.resource_id ? `资源 ${task.resource_id.slice(0, 8)}` : '—' }}</small></button></td>
               <td>{{ taskTypeLabel(task.task_type) }}</td>
               <td><div class="task-progress"><div class="progress-track"><span :style="{ width: `${task.percent}%` }" /></div><small>{{ task.processed }} / {{ task.total }}（{{ task.percent }}%）</small></div></td>
-              <td><span class="task-result-counts">有效 {{ task.valid_count }} · 无效 {{ task.invalid_count }} · 待确认 {{ task.inconclusive_count }} · 跳过 {{ task.skipped_count }}</span></td>
+              <td><span class="task-result-counts">有效 {{ task.valid_count }} · 无效 {{ task.invalid_count }} · 待确认 {{ task.inconclusive_count }} · RT 恢复 {{ task.recoverable_count }} · 跳过 {{ task.skipped_count }}</span></td>
               <td>{{ formatDate(task.created_at) }}</td>
               <td><StatusPill :label="statusLabel(task.status)" :tone="statusTone(task.status)" size="xs" radius="rounded" /></td>
             </tr>
@@ -1610,7 +1610,7 @@ onUnmounted(() => {
       </div>
       <div class="task-detail-progress">
         <div class="progress-track"><span :style="{ width: `${operationTaskDetail.percent}%` }" /></div>
-        <div class="task-detail-counts"><span>有效 <b>{{ operationTaskDetail.valid_count }}</b></span><span>无效 <b>{{ operationTaskDetail.invalid_count }}</b></span><span>待确认 <b>{{ operationTaskDetail.inconclusive_count }}</b></span><span>跳过 <b>{{ operationTaskDetail.skipped_count }}</b></span><span>失败 <b>{{ operationTaskDetail.failed_count }}</b></span></div>
+        <div class="task-detail-counts"><span>有效 <b>{{ operationTaskDetail.valid_count }}</b></span><span>无效 <b>{{ operationTaskDetail.invalid_count }}</b></span><span>待确认 <b>{{ operationTaskDetail.inconclusive_count }}</b></span><span>RT 恢复 <b>{{ operationTaskDetail.recoverable_count }}</b></span><span>跳过 <b>{{ operationTaskDetail.skipped_count }}</b></span><span>失败 <b>{{ operationTaskDetail.failed_count }}</b></span></div>
       </div>
       <CalloutBox v-if="operationTaskDetail.error_message" tone="error" variant="soft" size="sm">{{ operationTaskDetail.error_message }}</CalloutBox>
       <CalloutBox v-if="operationTaskDetailError" tone="error" variant="soft" size="sm">{{ operationTaskDetailError }}</CalloutBox>

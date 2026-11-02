@@ -141,40 +141,15 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         options=(("远端验活", "remote"), ("结构检查", "structural")),
     ),
     RuntimeSettingSpec(
-        "validation_timeout_seconds",
-        "validation",
-        "验活",
-        "单次请求超时",
-        "单次远端请求最长等待时间",
-        "number",
-        30,
-        0.1,
-        300,
-        "秒",
-    ),
-    RuntimeSettingSpec(
-        "validation_attempts",
-        "validation",
-        "验活",
-        "最大尝试次数",
-        "单个账号远端验活失败后的最大尝试次数",
-        "integer",
-        3,
-        1,
-        10,
-        "次",
-    ),
-    RuntimeSettingSpec(
         "validation_concurrency",
         "validation",
         "验活",
         "并发验活数量",
-        "同一进程同时执行的账号验活数量",
+        "每批同时执行的账号验活数量",
         "integer",
-        2,
+        10,
         1,
-        32,
-        "个",
+        50,
     ),
     RuntimeSettingSpec(
         "validation_egress_mode",
@@ -189,25 +164,6 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
             ("账号代理", "account"),
             ("代理池", "pool"),
         ),
-    ),
-    RuntimeSettingSpec(
-        "validation_probe_mode",
-        "validation",
-        "验活",
-        "验活探测模式",
-        "严格模式会额外检查账号接口",
-        "select",
-        "fast",
-        options=(("快速", "fast"), ("严格", "strict")),
-    ),
-    RuntimeSettingSpec(
-        "validation_impersonate",
-        "validation",
-        "验活",
-        "浏览器指纹",
-        "curl_cffi 使用的 impersonate 名称",
-        "string",
-        "chrome146",
     ),
     RuntimeSettingSpec(
         "validation_proxy",
@@ -226,66 +182,6 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         "多个代理可用逗号、分号或换行分隔",
         "string",
         "",
-    ),
-    RuntimeSettingSpec(
-        "validation_retry_base_seconds",
-        "validation",
-        "验活",
-        "重试初始等待",
-        "临时错误重试的初始等待时间",
-        "number",
-        2,
-        0,
-        60,
-        "秒",
-    ),
-    RuntimeSettingSpec(
-        "validation_retry_max_seconds",
-        "validation",
-        "验活",
-        "重试最长等待",
-        "指数退避的最长等待时间",
-        "number",
-        30,
-        0,
-        300,
-        "秒",
-    ),
-    RuntimeSettingSpec(
-        "validation_retry_jitter_seconds",
-        "validation",
-        "验活",
-        "重试随机抖动",
-        "重试等待的随机增加范围",
-        "number",
-        0.5,
-        0,
-        60,
-        "秒",
-    ),
-    RuntimeSettingSpec(
-        "validation_gate_threshold",
-        "validation",
-        "验活",
-        "风控触发阈值",
-        "60 秒内达到此数量后暂停新的验活请求",
-        "integer",
-        5,
-        1,
-        1000,
-        "次",
-    ),
-    RuntimeSettingSpec(
-        "validation_cooldown_seconds",
-        "validation",
-        "验活",
-        "风控冷却时间",
-        "触发阈值后的暂停时间",
-        "number",
-        60,
-        0,
-        3600,
-        "秒",
     ),
     RuntimeSettingSpec(
         "redelivery_window_seconds",
@@ -315,16 +211,16 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         "OAuth Client ID",
         "Refresh Token 兑换使用的 OAuth 客户端标识",
         "string",
-        "app_2SKx67EdpoN0G6j64rFvigXD",
+        "app_EMoamEEZ73f0CkXaXp7hrann",
     ),
     RuntimeSettingSpec(
         "oauth_redirect_uri",
         "delivery",
         "交付",
         "OAuth Redirect URI",
-        "留空时不向 OAuth 服务发送 redirect_uri",
+        "账号未提供时使用此回调地址；Platform 客户端不发送",
         "string",
-        "",
+        "http://localhost:1455/auth/callback",
     ),
     RuntimeSettingSpec(
         "max_upload_bytes",
@@ -390,8 +286,6 @@ class Settings:
     credential_secret: str
     cdk_pepper: str
     validation_mode: str
-    validation_timeout_seconds: float
-    validation_attempts: int
     validation_concurrency: int
     redelivery_window_seconds: int
     public_base_url: str
@@ -405,15 +299,8 @@ class Settings:
     export_retention_seconds: int = 86400
     export_dir: str = ""
     validation_proxy: str = ""
-    validation_retry_base_seconds: float = 1.0
-    validation_retry_max_seconds: float = 30.0
-    validation_retry_jitter_seconds: float = 0.25
     validation_proxy_pool: str = ""
     validation_egress_mode: str = "direct"
-    validation_probe_mode: str = "fast"
-    validation_cooldown_seconds: float = 60.0
-    validation_gate_threshold: int = 5
-    validation_impersonate: str = "chrome146"
     account_auto_delete_days: int = 30
     exhausted_cdk_auto_delete_days: int = 30
 
@@ -432,9 +319,7 @@ def get_settings() -> Settings:
         credential_secret=os.getenv("CREDENTIAL_SECRET", "development-credential-secret"),
         cdk_pepper=os.getenv("CDK_PEPPER", "development-cdk-pepper"),
         validation_mode=os.getenv("VALIDATION_MODE", "remote").strip().lower(),
-        validation_timeout_seconds=float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "30")),
-        validation_attempts=max(1, int(os.getenv("VALIDATION_ATTEMPTS", "3"))),
-        validation_concurrency=max(1, int(os.getenv("VALIDATION_CONCURRENCY", "2"))),
+        validation_concurrency=max(1, min(50, int(os.getenv("VALIDATION_CONCURRENCY", "10")))),
         redelivery_window_seconds=max(0, int(os.getenv("REDELIVERY_WINDOW_SECONDS", "1800"))),
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:1456").rstrip("/"),
         max_upload_bytes=parse_size_bytes(os.getenv("MAX_UPLOAD_BYTES", "100M")),
@@ -443,31 +328,14 @@ def get_settings() -> Settings:
         max_zip_uncompressed_bytes=int(
             os.getenv("MAX_ZIP_UNCOMPRESSED_BYTES", str(100 * 1024 * 1024))
         ),
-        oauth_client_id=os.getenv("OPENAI_OAUTH_CLIENT_ID", "app_2SKx67EdpoN0G6j64rFvigXD"),
-        oauth_redirect_uri=os.getenv("OPENAI_OAUTH_REDIRECT_URI", ""),
+        oauth_client_id=os.getenv("OPENAI_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"),
+        oauth_redirect_uri=os.getenv("OPENAI_OAUTH_REDIRECT_URI", "http://localhost:1455/auth/callback"),
         operation_log_retention_days=max(1, int(os.getenv("OPERATION_LOG_RETENTION_DAYS", "30"))),
         export_retention_seconds=max(300, int(os.getenv("EXPORT_RETENTION_SECONDS", "86400"))),
         export_dir=os.getenv("EXPORT_DIR", str(PROJECT_ROOT / "data" / "exports")),
         validation_proxy=os.getenv("VALIDATION_PROXY", "").strip(),
-        validation_retry_base_seconds=max(
-            0.0, float(os.getenv("VALIDATION_RETRY_BASE_SECONDS", "2"))
-        ),
-        validation_retry_max_seconds=max(
-            0.0, float(os.getenv("VALIDATION_RETRY_MAX_SECONDS", "30"))
-        ),
-        validation_retry_jitter_seconds=max(
-            0.0, float(os.getenv("VALIDATION_RETRY_JITTER_SECONDS", "0.5"))
-        ),
         validation_proxy_pool=os.getenv("VALIDATION_PROXY_POOL", "").strip(),
         validation_egress_mode=os.getenv("VALIDATION_EGRESS_MODE", "direct").strip().lower(),
-        validation_probe_mode=os.getenv("VALIDATION_PROBE_MODE", "fast").strip().lower(),
-        validation_cooldown_seconds=max(
-            0.0, float(os.getenv("VALIDATION_COOLDOWN_SECONDS", "60"))
-        ),
-        validation_gate_threshold=max(
-            1, int(os.getenv("VALIDATION_GATE_THRESHOLD", "5"))
-        ),
-        validation_impersonate=os.getenv("VALIDATION_IMPERSONATE", "chrome146").strip() or "chrome146",
         account_auto_delete_days=max(0, int(os.getenv("ACCOUNT_AUTO_DELETE_DAYS", "30"))),
         exhausted_cdk_auto_delete_days=max(
             0, int(os.getenv("EXHAUSTED_CDK_AUTO_DELETE_DAYS", "30"))

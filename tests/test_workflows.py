@@ -8,6 +8,8 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from app.models import Account, Redelivery, Redemption, utcnow
 from app.services.validator import ValidationResult
 
@@ -259,6 +261,57 @@ def test_quarantined_account_is_revalidated_for_public_redemption(client, admin_
 
     with client.app.state.session_factory() as session:
         assert session.get(Account, account_id).status == "delivered"
+
+
+@pytest.mark.parametrize("initial_status", ["available", "quarantined"])
+def test_inconclusive_redemption_checks_each_candidate_once_and_releases_leases(
+    client, admin_headers, monkeypatch, initial_status,
+):
+    _import_accounts(client, admin_headers, count=2)
+    with client.app.state.session_factory.begin() as session:
+        for account in session.query(Account).all():
+            account.status = initial_status
+    checked = []
+    def inconclusive(account):
+        checked.append(account.id)
+        assert len(checked) <= 2, "temporary failures must not loop over the same inventory"
+        return ValidationResult("inconclusive", "transient", "Token 验证暂不可用: HTTP 429")
+    monkeypatch.setattr(client.app.state.validator, "validate", inconclusive)
+    code = _generate_cdks(client, admin_headers, count=1)[0]
+    response = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": f"temporary-{initial_status}", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "failed"
+    assert response.json()["delivered_count"] == 0
+    assert len(checked) == len(set(checked)) == 2
+    with client.app.state.session_factory() as session:
+        accounts = session.query(Account).all()
+        assert all(account.status == initial_status for account in accounts)
+        assert all(account.reserved_by is None and account.reserved_until is None for account in accounts)
+
+
+def test_redemption_replaces_inconclusive_candidate_with_another_account(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers, count=2)
+    checked = []
+    def validate(account):
+        checked.append(account.id)
+        return ValidationResult("inconclusive", "transient") if len(checked) == 1 else ValidationResult("valid")
+    monkeypatch.setattr(client.app.state.validator, "validate", validate)
+    code = _generate_cdks(client, admin_headers, count=1)[0]
+    response = client.post(
+        "/api/v1/redemptions",
+        headers={"Idempotency-Key": "replace-temporary-candidate", "Prefer": "wait=3"},
+        json={"codes": [code]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert len(set(checked)) == 2
+    with client.app.state.session_factory() as session:
+        assert session.get(Account, checked[0]).status == "available"
+        assert session.get(Account, checked[1]).status == "delivered"
 
 
 def test_redeemed_cdk_redelivers_only_its_accounts_without_validation(client, admin_headers, monkeypatch):

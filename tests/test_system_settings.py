@@ -13,6 +13,7 @@ from app.models import (
     utcnow,
 )
 from app.services.operations import cleanup_inventory_data, cleanup_operation_data
+from app.services.system_settings import load_system_settings
 
 
 def _setting_values(payload: dict) -> dict:
@@ -21,6 +22,24 @@ def _setting_values(payload: dict) -> dict:
         for group in payload["groups"]
         for item in group["items"]
     }
+
+
+def test_obsolete_validation_policy_settings_do_not_override_manager_behavior(client, admin_headers, settings):
+    obsolete = {
+        "validation_timeout_seconds": "1", "validation_attempts": "1",
+        "validation_probe_mode": "fast", "validation_impersonate": "chrome146",
+        "validation_retry_base_seconds": "30", "validation_retry_max_seconds": "60",
+        "validation_retry_jitter_seconds": "10",
+        "validation_gate_threshold": "1", "validation_cooldown_seconds": "600",
+    }
+    with client.app.state.session_factory.begin() as session:
+        for key, value in obsolete.items():
+            session.add(SystemSetting(key=key, value=value))
+        session.flush()
+        loaded = load_system_settings(session, settings)
+        assert all(not hasattr(loaded, key) for key in obsolete)
+    response = client.get("/api/v1/admin/settings", headers=admin_headers)
+    assert not obsolete.keys() & _setting_values(response.json()).keys()
 
 
 def test_system_settings_are_persisted_and_applied_immediately(client, admin_headers):
@@ -38,7 +57,7 @@ def test_system_settings_are_persisted_and_applied_immediately(client, admin_hea
             "values": {
                 "account_auto_delete_days": 14,
                 "operation_log_retention_days": 7,
-                "validation_timeout_seconds": 4.5,
+                "validation_concurrency": 3,
                 "max_upload_bytes": "25M",
             }
         },
@@ -48,11 +67,11 @@ def test_system_settings_are_persisted_and_applied_immediately(client, admin_hea
     values = _setting_values(updated.json())
     assert values["account_auto_delete_days"] == 14
     assert values["operation_log_retention_days"] == 7
-    assert values["validation_timeout_seconds"] == 4.5
+    assert values["validation_concurrency"] == 3
     assert values["max_upload_bytes"] == "25M"
     assert client.app.state.settings.account_auto_delete_days == 14
     assert client.app.state.settings.operation_log_retention_days == 7
-    assert client.app.state.settings.validation_timeout_seconds == 4.5
+    assert client.app.state.settings.validation_concurrency == 3
     assert client.app.state.settings.max_upload_bytes == 25 * 1024 * 1024
 
     with client.app.state.session_factory() as session:

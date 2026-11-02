@@ -4,687 +4,490 @@ from collections import deque
 from dataclasses import replace
 from datetime import timedelta
 import json
+import re
 from typing import Any
 
-from app.models import Account, utcnow
+import pytest
+
+from app.models import Account, ValidationAttempt, utcnow
 from app.security import SecurityManager
-from app.services.validator import TokenValidator, apply_validation
+from app.services.openai_validation import (
+    CHATGPT_VALIDATION_IMPERSONATE,
+    CHATGPT_VALIDATION_USER_AGENT,
+    PLATFORM_OAUTH_CLIENT_ID,
+    latest_chrome_impersonate,
+)
+from app.services.validator import TokenValidator, apply_validation, validation_result_details
 
 
 class FakeResponse:
-    def __init__(
-        self,
-        status_code: int,
-        payload: Any = None,
-        text: str = "",
-        headers: dict[str, str] | None = None,
-    ):
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
         self.status_code = status_code
-        self.payload = payload
+        self.payload = {} if payload is None else payload
         self.text = text
         self.headers = headers or {}
 
-    def json(self) -> Any:
+    def json(self):
         if isinstance(self.payload, Exception):
             raise self.payload
         return self.payload
 
 
 class ScriptedSessions:
-    def __init__(self, steps: list[tuple[str, str, FakeResponse]]):
+    def __init__(self, steps):
         self.steps = deque(steps)
         self.calls: list[dict[str, Any]] = []
+        self.sessions: list[ScriptedSession] = []
 
-    def __call__(self) -> "ScriptedSession":
-        return ScriptedSession(self)
+    def __call__(self):
+        session = ScriptedSession(self)
+        self.sessions.append(session)
+        return session
 
-    def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+    def request(self, session, method, url, **kwargs):
+        self.calls.append({"session": session, "method": method, "url": url, **kwargs})
         assert self.steps, f"unexpected {method} {url}"
         expected_method, expected_url, response = self.steps.popleft()
         assert (method, url) == (expected_method, expected_url)
-        self.calls.append({"method": method, "url": url, **kwargs})
+        if isinstance(response, Exception):
+            raise response
         return response
 
-    def assert_complete(self) -> None:
+    def assert_complete(self):
         assert not self.steps
+        assert all(session.closed for session in self.sessions)
 
 
 class ScriptedSession:
-    def __init__(self, owner: ScriptedSessions):
+    def __init__(self, owner):
         self.owner = owner
+        self.closed = False
+        self.cookie_values = []
+        self.cookies = self
 
-    def get(self, url: str, **kwargs: Any) -> FakeResponse:
-        return self.owner.request("GET", url, **kwargs)
+    def set(self, name, value, **kwargs):
+        self.cookie_values.append((name, value, kwargs))
 
-    def post(self, url: str, **kwargs: Any) -> FakeResponse:
-        return self.owner.request("POST", url, **kwargs)
+    def get(self, url, **kwargs):
+        return self.owner.request(self, "GET", url, **kwargs)
 
-    def close(self) -> None:
-        pass
+    def post(self, url, **kwargs):
+        return self.owner.request(self, "POST", url, **kwargs)
 
-
-def _response(
-    status_code: int = 200,
-    payload: Any = None,
-    text: str = "",
-    headers: dict[str, str] | None = None,
-) -> FakeResponse:
-    return FakeResponse(status_code, {} if payload is None else payload, text, headers)
+    def close(self):
+        self.closed = True
 
 
-def _account(
-    security: SecurityManager,
-    *,
-    access_token: str = "old-access-token",
-    refresh_token: str = "old-refresh-token",
-    expires_at=None,
-    extra_data: dict[str, Any] | None = None,
-    proxy_used: str | None = None,
-) -> Account:
+@pytest.fixture(autouse=True)
+def retry_delays(monkeypatch):
+    delays = []
+    monkeypatch.setattr("app.services.openai_validation.time.sleep", delays.append)
+    return delays
+
+
+@pytest.fixture
+def security():
+    return SecurityManager("validator-secret", "validator-pepper")
+
+
+def _account(security, *, access_token="old-access-token", refresh_token="old-refresh-token",
+             status="available", extra_data=None, **kwargs):
     return Account(
-        email="person@example.com",
-        account_id="account-validator-test",
+        email="person@example.com", account_id=kwargs.pop("account_id", "account-validator-test"),
         access_token_encrypted=security.encrypt(access_token),
         refresh_token_encrypted=security.encrypt(refresh_token),
-        expires_at=expires_at,
-        extra_data=json.dumps(extra_data, ensure_ascii=False) if extra_data else None,
-        proxy_used=proxy_used,
+        status=status, extra_data=json.dumps(extra_data) if extra_data else None, **kwargs,
     )
 
 
-def _remote_validator(settings, security: SecurityManager, steps: list[tuple[str, str, FakeResponse]]):
-    validator = TokenValidator(replace(settings, validation_mode="remote", validation_attempts=1), security)
+def _remote_validator(settings, security, steps):
+    validator = TokenValidator(replace(settings, validation_mode="remote"), security)
     sessions = ScriptedSessions(steps)
     validator._session = sessions
     return validator, sessions
 
 
-def _userinfo() -> str:
-    return TokenValidator.validation_url
+USERINFO = TokenValidator.validation_url
+INIT = TokenValidator.chatgpt_base_url + TokenValidator.conversation_init_path
+CHECK = TokenValidator.chatgpt_base_url + TokenValidator.account_check_path + "?timezone_offset_min=-480"
+REFRESH = TokenValidator.token_url
 
 
-def _conversation_init() -> str:
-    return TokenValidator.chatgpt_base_url + TokenValidator.conversation_init_path
+def _success():
+    return [("GET", USERINFO, FakeResponse()), ("POST", INIT, FakeResponse()), ("GET", CHECK, FakeResponse())]
 
 
-def _account_check() -> str:
-    return (
-        TokenValidator.chatgpt_base_url
-        + TokenValidator.account_check_path
-        + "?timezone_offset_min=-480"
-    )
+def _refresh_success():
+    return ("POST", REFRESH, FakeResponse(payload={
+        "access_token": "new-access-token", "refresh_token": "new-refresh-token",
+        "id_token": "new-id-token", "expires_in": 3600,
+    }))
 
 
-def test_remote_validation_requires_userinfo_and_both_product_probes(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
+def test_full_manager_request_chain_headers_payload_and_device_cookies(settings, security):
+    validator, sessions = _remote_validator(settings, security, _success())
     result = validator.validate(_account(security))
-
     assert result.outcome == "valid"
-    assert [(call["method"], call["url"]) for call in sessions.calls] == [
-        ("GET", _userinfo()),
-        ("POST", _conversation_init()),
-        ("GET", _account_check()),
-    ]
-    conversation_headers = sessions.calls[1]["headers"]
-    account_headers = sessions.calls[2]["headers"]
-    assert conversation_headers["authorization"] == "Bearer old-access-token"
-    assert conversation_headers["x-openai-target-path"] == TokenValidator.conversation_init_path
-    assert conversation_headers["user-agent"] == TokenValidator.chatgpt_validation_user_agent
-    assert conversation_headers["oai-client-version"] == TokenValidator.chatgpt_validation_client_version
-    assert conversation_headers["oai-client-build-number"] == TokenValidator.chatgpt_validation_build_number
-    assert conversation_headers["content-type"] == "application/json"
-    assert conversation_headers["sec-fetch-site"] == "same-origin"
-    assert account_headers["x-openai-target-route"] == TokenValidator.account_check_path
-    assert conversation_headers["oai-device-id"] == account_headers["oai-device-id"]
-    assert conversation_headers["oai-session-id"] == account_headers["oai-session-id"]
-    sessions.assert_complete()
-
-
-def test_fast_probe_skips_account_check(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(settings, validation_probe_mode="fast"),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-        ],
-    )
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "valid"
-    assert [call["url"] for call in sessions.calls] == [_userinfo(), _conversation_init()]
-    sessions.assert_complete()
-
-
-def test_product_401_forces_refresh_and_rechecks_all_probes(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-            (
-                "POST",
-                TokenValidator.token_url,
-                _response(payload={"access_token": "new-access-token", "refresh_token": "new-refresh-token", "expires_in": 3600}),
-            ),
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "valid"
-    assert result.validated_via == "refresh_token"
-    assert result.access_token == "new-access-token"
-    assert result.refresh_token == "new-refresh-token"
-    assert [(call["method"], call["url"]) for call in sessions.calls] == [
-        ("GET", _userinfo()),
-        ("POST", _conversation_init()),
-        ("POST", TokenValidator.token_url),
-        ("GET", _userinfo()),
-        ("POST", _conversation_init()),
-        ("GET", _account_check()),
-    ]
-    sessions.assert_complete()
-
-
-def test_product_401_without_refresh_token_is_invalid(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-        ],
-    )
-
-    result = validator.validate(_account(security, refresh_token=""))
-
-    assert result.outcome == "invalid"
-    assert result.error_type == "access_token"
-    sessions.assert_complete()
-
-
-def test_product_403_with_unauthorized_detail_is_invalid(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(403, text="unauthorized")),
-        ],
-    )
-
-    result = validator.validate(_account(security, refresh_token=""))
-
-    assert result.outcome == "invalid"
-    assert result.error_type == "access_token"
-    assert all(call["url"] != TokenValidator.token_url for call in sessions.calls)
-    sessions.assert_complete()
-
-
-def test_remote_validation_passes_proxy_per_request(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(settings, validation_proxy="http://validation-proxy.example:8080"),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "valid"
-    assert all(
-        call["proxies"] == {
-            "http": "http://validation-proxy.example:8080",
-            "https": "http://validation-proxy.example:8080",
-        }
-        for call in sessions.calls
-    )
-    sessions.assert_complete()
-
-
-def test_account_proxy_overrides_global_proxy_for_all_validation_requests(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(
-            settings,
-            validation_proxy="http://global-proxy.example:8080",
-            validation_proxy_pool="http://pool-proxy.example:8080",
-        ),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(
-        _account(
-            security,
-            extra_data={"proxy_used": "http://account-proxy.example:8080"},
-        )
-    )
-
-    assert result.outcome == "valid"
-    expected = {
-        "http": "http://account-proxy.example:8080",
-        "https": "http://account-proxy.example:8080",
+    assert result.current_access_token_valid is True
+    assert result.stage == "accounts/check"
+    assert result.attempts == 3
+    assert sessions.calls[0]["headers"] == {
+        "authorization": "Bearer old-access-token", "accept": "application/json",
     }
-    assert all(call["proxies"] == expected for call in sessions.calls)
-    sessions.assert_complete()
-
-
-def test_explicit_validation_proxy_overrides_account_proxy(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(settings, validation_proxy="http://global-proxy.example:8080"),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(
-        _account(
-            security,
-            proxy_used="http://account-proxy.example:8080",
-        ),
-        validation_proxy="http://request-proxy.example:8080",
-    )
-
-    assert result.outcome == "valid"
-    expected = {
-        "http": "http://request-proxy.example:8080",
-        "https": "http://request-proxy.example:8080",
+    headers = sessions.calls[1]["headers"]
+    device_id, session_id = headers["oai-device-id"], headers["oai-session-id"]
+    assert headers == {
+        "authorization": "Bearer old-access-token",
+        "accept": "application/json", "content-type": "application/json",
+        "origin": "https://chatgpt.com", "referer": "https://chatgpt.com/",
+        "user-agent": CHATGPT_VALIDATION_USER_AGENT,
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "oai-device-id": device_id, "oai-session-id": session_id,
+        "oai-language": "zh-CN", "oai-client-version": "26.1022.91109",
+        "x-openai-target-path": TokenValidator.conversation_init_path,
+        "x-openai-target-route": TokenValidator.conversation_init_path,
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
     }
-    assert all(call["proxies"] == expected for call in sessions.calls)
-    sessions.assert_complete()
-
-
-def test_direct_validation_ignores_account_and_global_proxy(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(
-            settings,
-            validation_egress_mode="direct",
-            validation_proxy="http://global-proxy.example:8080",
-        ),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(
-        _account(security, proxy_used="http://account-proxy.example:8080")
-    )
-
-    assert result.outcome == "valid"
-    assert all("proxies" not in call for call in sessions.calls)
-    sessions.assert_complete()
-
-
-def test_validation_proxy_pool_is_selected_once_for_retry(monkeypatch, settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator = TokenValidator(
-        replace(
-            settings,
-            validation_mode="remote",
-            validation_attempts=2,
-            validation_proxy="",
-            validation_proxy_pool="http://pool-a.example:8080,http://pool-b.example:8080",
-            validation_retry_base_seconds=0,
-            validation_retry_max_seconds=0,
-            validation_retry_jitter_seconds=0,
-        ),
-        security,
-    )
-    sessions = ScriptedSessions(
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(403)),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ]
-    )
-    validator._session = sessions
-    monkeypatch.setattr("app.services.validator.random.choice", lambda values: values[0])
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "valid"
-    expected = {
-        "http": "http://pool-a.example:8080",
-        "https": "http://pool-a.example:8080",
+    assert sessions.calls[2]["headers"] == {
+        **headers, "x-openai-target-path": TokenValidator.account_check_path,
+        "x-openai-target-route": TokenValidator.account_check_path,
     }
-    assert all(call["proxies"] == expected for call in sessions.calls)
-    sessions.assert_complete()
-
-
-def test_product_gate_retries_with_retry_after_and_skips_second_probe(settings, monkeypatch):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator = TokenValidator(
-        replace(
-            settings,
-            validation_mode="remote",
-            validation_attempts=2,
-            validation_retry_base_seconds=1,
-            validation_retry_max_seconds=10,
-            validation_retry_jitter_seconds=0,
-        ),
-        security,
-    )
-    sessions = ScriptedSessions(
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(403, headers={"Retry-After": "2"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ]
-    )
-    validator._session = sessions
-    sleeps: list[float] = []
-    monkeypatch.setattr("app.services.validator.time.sleep", sleeps.append)
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "valid"
-    assert sleeps == [2]
-    assert [(call["method"], call["url"]) for call in sessions.calls] == [
-        ("GET", _userinfo()),
-        ("POST", _conversation_init()),
-        ("POST", _conversation_init()),
-        ("GET", _account_check()),
-    ]
-    conversation_calls = [
-        call for call in sessions.calls if call["url"] == _conversation_init()
-    ]
-    assert conversation_calls[0]["headers"]["oai-device-id"] == conversation_calls[1]["headers"]["oai-device-id"]
-    assert conversation_calls[0]["headers"]["oai-session-id"] == conversation_calls[1]["headers"]["oai-session-id"]
-    sessions.assert_complete()
-
-
-def test_product_gate_uses_exponential_backoff_without_retry_after(settings, monkeypatch):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator = TokenValidator(
-        replace(
-            settings,
-            validation_mode="remote",
-            validation_attempts=3,
-            validation_retry_base_seconds=1,
-            validation_retry_max_seconds=10,
-            validation_retry_jitter_seconds=0,
-        ),
-        security,
-    )
-    sessions = ScriptedSessions(
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(403)),
-            ("POST", _conversation_init(), _response(403)),
-            ("POST", _conversation_init(), _response(403)),
-        ]
-    )
-    validator._session = sessions
-    sleeps: list[float] = []
-    monkeypatch.setattr("app.services.validator.time.sleep", sleeps.append)
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "inconclusive"
-    assert sleeps == [1, 2]
-    assert [call["url"] for call in sessions.calls] == [
-        _userinfo(),
-        _conversation_init(),
-        _conversation_init(),
-        _conversation_init(),
+    assert sessions.calls[1]["json"] == {
+        "gizmo_id": None, "requested_default_model": None,
+        "conversation_id": None, "timezone_offset_min": -480,
+    }
+    assert all(call["timeout"] == 30 for call in sessions.calls)
+    assert len(sessions.sessions) == 1
+    assert sessions.sessions[0].cookie_values == [
+        ("oai-did", device_id, {"domain": "chatgpt.com", "path": "/"}),
+        ("oai-did", device_id, {"domain": ".chatgpt.com", "path": "/"}),
     ]
     sessions.assert_complete()
 
 
-def test_cloudflare_html_403_is_inconclusive(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            (
-                "POST",
-                _conversation_init(),
-                _response(
-                    403,
-                    text="<!doctype html><html><title>Just a moment...</title></html>",
-                    headers={
-                        "content-type": "text/html; charset=UTF-8",
-                        "cf-mitigated": "challenge",
-                        "cf-ray": "test-ray",
-                        "server": "cloudflare",
-                    },
-                ),
-            ),
-        ],
-    )
-
-    result = validator.validate(_account(security, refresh_token=""))
-
-    assert result.outcome == "inconclusive"
-    assert result.error_type == "transient"
-    assert result.stage == "conversation/init"
-    assert result.status_code == 403
-    assert result.cf_mitigated == "challenge"
-    assert result.cf_ray == "test-ray"
-    assert "Cloudflare Challenge" in result.message
-    sessions.assert_complete()
-
-
-def test_gate_cooldown_skips_new_upstream_requests(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(
-            settings,
-            validation_attempts=1,
-            validation_gate_threshold=1,
-            validation_cooldown_seconds=60,
-        ),
-        security,
-        [
-            ("GET", _userinfo(), _response(403)),
-        ],
-    )
-
-    first = validator.validate(_account(security, refresh_token=""))
-    second = validator.validate(_account(security, refresh_token=""))
-
-    assert first.outcome == "inconclusive"
-    assert second.outcome == "inconclusive"
-    assert second.stage == "cooldown"
-    assert len(sessions.calls) == 1
-    sessions.assert_complete()
-
-
-def test_session_uses_configured_impersonate(monkeypatch, settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    captured: dict[str, Any] = {}
-
-    class FakeSession:
-        def close(self):
-            pass
-
-    def fake_session(**kwargs):
-        captured.update(kwargs)
-        return FakeSession()
-
-    monkeypatch.setattr("app.services.validator.cffi_requests.Session", fake_session)
-    validator = TokenValidator(replace(settings, validation_impersonate="chrome146"), security)
-
+def test_browser_profile_and_user_agent_follow_installed_curl(settings, security, monkeypatch):
+    captured = []
+    monkeypatch.setattr("app.services.validator.cffi_requests.Session", lambda **kwargs: captured.append(kwargs))
+    validator = TokenValidator(settings, security)
     validator._session()
+    assert captured == [{"impersonate": latest_chrome_impersonate()}]
+    assert CHATGPT_VALIDATION_IMPERSONATE == latest_chrome_impersonate()
+    major = re.fullmatch(r"chrome(\d+)[a-z_]*", CHATGPT_VALIDATION_IMPERSONATE)[1]
+    assert f"Chrome/{major}.0.0.0" in CHATGPT_VALIDATION_USER_AGENT
 
-    assert captured == {"impersonate": "chrome146"}
 
-
-def test_only_terminal_refresh_failure_marks_account_invalid(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-            ("POST", TokenValidator.token_url, _response(400, payload={"error": "invalid_grant"})),
-        ],
-    )
-
+@pytest.mark.parametrize("stage", ["userinfo", "conversation/init", "accounts/check"])
+def test_temporary_failure_restarts_entire_chain_with_new_session_and_same_device(
+    settings, security, retry_delays, stage,
+):
+    prefix = [] if stage == "userinfo" else _success()[:1 if stage == "conversation/init" else 2]
+    method, url = {"userinfo": ("GET", USERINFO), "conversation/init": ("POST", INIT),
+                   "accounts/check": ("GET", CHECK)}[stage]
+    failed = prefix + [(method, url, FakeResponse(429, headers={"Retry-After": "20"}))]
+    validator, sessions = _remote_validator(settings, security, failed + failed + _success())
     result = validator.validate(_account(security))
-
-    assert result.outcome == "invalid"
-    assert result.error_type == "refresh_token"
-    sessions.assert_complete()
-
-
-def test_nonterminal_refresh_failure_is_inconclusive(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-            ("POST", TokenValidator.token_url, _response(400, payload={"error": "invalid_request"})),
-        ],
-    )
-
-    result = validator.validate(_account(security))
-
-    assert result.outcome == "inconclusive"
-    assert result.error_type == "transient"
-    sessions.assert_complete()
-
-
-def test_expiring_access_token_refreshes_before_remote_probes(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            (
-                "POST",
-                TokenValidator.token_url,
-                _response(payload={"access_token": "new-access-token", "refresh_token": "new-refresh-token", "expires_in": 3600}),
-            ),
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-
-    result = validator.validate(_account(security, expires_at=utcnow() - timedelta(seconds=1)))
-
     assert result.outcome == "valid"
-    assert sessions.calls[0]["url"] == TokenValidator.token_url
+    assert retry_delays == [0.25, 0.75]
+    assert len(sessions.sessions) == 3
+    for session in sessions.sessions:
+        assert next(call for call in sessions.calls if call["session"] is session)["url"] == USERINFO
+    assert len({session.cookie_values[0][1] for session in sessions.sessions}) == 1
+    product_headers = [call["headers"] for call in sessions.calls if call["url"] in {INIT, CHECK}]
+    assert len({headers["oai-device-id"] for headers in product_headers}) == 1
+    assert len({headers["oai-session-id"] for headers in product_headers}) == 1
     sessions.assert_complete()
 
 
-def test_refresh_stays_direct_but_refreshed_token_validation_reuses_account_proxy(settings):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        replace(settings, validation_proxy="http://global-proxy.example:8080"),
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-            (
-                "POST",
-                TokenValidator.token_url,
-                _response(
-                    payload={
-                        "access_token": "new-access-token",
-                        "refresh_token": "new-refresh-token",
-                        "expires_in": 3600,
-                    }
-                ),
-            ),
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(payload={"limits_progress": []})),
-            ("GET", _account_check(), _response(payload={"accounts": {}})),
-        ],
-    )
-    account = _account(
-        security,
-        extra_data={"proxy_url": "http://account-proxy.example:8080"},
-    )
-
-    result = validator.validate(account)
-
-    assert result.outcome == "valid"
-    expected_proxy = {
-        "http": "http://account-proxy.example:8080",
-        "https": "http://account-proxy.example:8080",
-    }
-    assert "proxies" not in sessions.calls[2]
-    assert all(
-        call["proxies"] == expected_proxy
-        for call in sessions.calls[:2] + sessions.calls[3:]
-    )
-    sessions.assert_complete()
-
-
-def test_rejected_refreshed_token_is_quarantined_and_rotated_credentials_are_saved(settings, client):
-    security = SecurityManager("validator-secret", "validator-pepper")
-    validator, sessions = _remote_validator(
-        settings,
-        security,
-        [
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-            (
-                "POST",
-                TokenValidator.token_url,
-                _response(payload={"access_token": "new-access-token", "refresh_token": "new-refresh-token", "expires_in": 3600}),
-            ),
-            ("GET", _userinfo(), _response(payload={"sub": "user-1"})),
-            ("POST", _conversation_init(), _response(401)),
-        ],
-    )
-    account = _account(security)
-
+@pytest.mark.parametrize("failure", [
+    FakeResponse(403, text="<html>Just a moment...</html>", headers={
+        "Content-Type": "text/html", "Server": "cloudflare",
+        "cf-mitigated": "challenge", "cf-ray": "test-ray", "Retry-After": "10",
+    }),
+    FakeResponse(429), FakeResponse(503), TimeoutError("upstream timeout"),
+])
+def test_transient_checks_do_not_refresh_or_change_previous_status(settings, client, security, failure, retry_delays):
+    validator, sessions = _remote_validator(settings, security, [("GET", USERINFO, failure)] * 3)
     with client.app.state.session_factory.begin() as session:
+        account = _account(security, status="available")
         session.add(account)
         session.flush()
         result = apply_validation(session, account, validator)
-
         assert result.outcome == "inconclusive"
-        assert account.status == "quarantined"
+        assert result.error_type == "transient"
+        assert account.status == "available"
+        assert account.validated_at is not None
+        assert account.last_refresh is None
+        if getattr(failure, "status_code", None) == 403:
+            assert result.status_code == 403
+            assert result.stage == "userinfo"
+            assert result.cf_mitigated == "challenge"
+            assert result.cf_ray == "test-ray"
+            assert result.server == "cloudflare"
+            assert result.content_type == "text/html"
+            assert result.retry_after == 10
+    assert retry_delays == [0.25, 0.75]
+    assert len(sessions.calls) == 3
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize("status", ["pending_validation", "quarantined", "expired", "banned"])
+def test_inconclusive_preserves_each_original_inventory_status(settings, client, security, status):
+    validator, sessions = _remote_validator(settings, security, [("GET", USERINFO, FakeResponse(503))] * 3)
+    with client.app.state.session_factory.begin() as session:
+        account = _account(security, status=status)
+        session.add(account)
+        session.flush()
+        assert apply_validation(session, account, validator).outcome == "inconclusive"
+        assert account.status == status
+    sessions.assert_complete()
+
+
+def test_failures_never_block_another_account_with_global_cooldown(settings, security):
+    failed = [("GET", USERINFO, FakeResponse(429))] * 3
+    validator, sessions = _remote_validator(settings, security, failed + failed + _success())
+    assert validator.validate(_account(security)).outcome == "inconclusive"
+    assert validator.validate(_account(security, account_id="another-account")).outcome == "inconclusive"
+    assert validator.validate(_account(security, account_id="healthy-account")).outcome == "valid"
+    assert len(sessions.calls) == 9
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize(("response", "outcome", "error_type"), [
+    (FakeResponse(401), "invalid", "access_token"),
+    (FakeResponse(403, payload={"detail": "Unauthorized"}), "invalid", "access_token"),
+    (FakeResponse(403, payload={"error": {"code": "account_deactivated"}}), "invalid", "access_token"),
+])
+def test_terminal_failures_stop_without_retries_when_no_rt(settings, security, response, outcome, error_type, retry_delays):
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse()), ("POST", INIT, response),
+    ])
+    result = validator.validate(_account(security, refresh_token=""))
+    assert result.outcome == outcome
+    assert result.error_type == error_type
+    assert retry_delays == []
+    sessions.assert_complete()
+
+
+def test_locally_expired_at_is_checked_before_consuming_rt(settings, security):
+    validator, sessions = _remote_validator(settings, security, _success())
+    result = validator.validate(_account(security, expires_at=utcnow() - timedelta(hours=1)))
+    assert result.outcome == "valid"
+    assert result.validated_via == "access_token"
+    assert result.refreshed is False
+    sessions.assert_complete()
+
+
+def test_terminal_at_refreshes_once_then_checks_all_endpoints_and_persists_encrypted_rotation(settings, client, security):
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse()), ("POST", INIT, FakeResponse(401)),
+        _refresh_success(), *_success(),
+    ])
+    with client.app.state.session_factory.begin() as session:
+        account = _account(security, status="expired", proxy_used="http://account-proxy.example:8080")
+        session.add(account)
+        session.flush()
+        result = apply_validation(session, account, validator)
+        assert result.outcome == "valid"
+        assert result.validated_via == "refresh_token"
+        assert result.refreshed and result.recoverable
+        assert result.current_access_token_valid is False
+        assert result.current_access_token_error_type == "access_token"
+        assert account.status == "available"
         assert security.decrypt(account.access_token_encrypted) == "new-access-token"
         assert security.decrypt(account.refresh_token_encrypted) == "new-refresh-token"
-        assert account.last_refresh is not None
-        assert account.version == 2
+        assert security.decrypt(account.id_token_encrypted) == "new-id-token"
+        assert "new-access-token" not in account.access_token_encrypted
+        assert account.expires_at > utcnow() + timedelta(minutes=59)
+        assert account.last_refresh is not None and account.version == 2
+    assert all(call["proxies"] == {
+        "http": "http://account-proxy.example:8080", "https": "http://account-proxy.example:8080",
+    } for call in sessions.calls)
+    assert sessions.calls[2]["data"] == {
+        "client_id": "test-client", "grant_type": "refresh_token", "refresh_token": "old-refresh-token",
+    }
+    assert sessions.calls[3]["headers"]["authorization"] == "Bearer new-access-token"
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize(("confirmation", "expected_outcome", "expected_status"), [
+    ([("GET", USERINFO, FakeResponse(401))], "invalid", "expired"),
+    ([("GET", USERINFO, FakeResponse(403, text="account banned"))], "invalid", "banned"),
+    ([("GET", USERINFO, FakeResponse(503))] * 3, "inconclusive", "available"),
+])
+def test_rotated_credentials_saved_even_when_new_at_check_fails(
+    settings, client, security, confirmation, expected_outcome, expected_status,
+):
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse(401)), _refresh_success(), *confirmation,
+    ])
+    with client.app.state.session_factory.begin() as session:
+        account = _account(security)
+        session.add(account)
+        session.flush()
+        result = apply_validation(session, account, validator)
+        assert result.outcome == expected_outcome
+        assert account.status == expected_status
+        assert security.decrypt(account.access_token_encrypted) == "new-access-token"
+        assert security.decrypt(account.refresh_token_encrypted) == "new-refresh-token"
+        assert account.version == 2 and account.last_refresh is not None
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize(("failure", "outcome", "error_type"), [
+    (FakeResponse(400, payload={"error": "invalid_grant"}), "invalid", "refresh_token"),
+    (FakeResponse(400, payload={"error": "invalid_request"}), "invalid", "refresh_token"),
+    (FakeResponse(401), "invalid", "refresh_token"),
+    (FakeResponse(200), "invalid", "refresh_token"),
+    (FakeResponse(429), "inconclusive", "transient"),
+    (FakeResponse(503), "inconclusive", "transient"),
+    (TimeoutError("timeout"), "inconclusive", "transient"),
+])
+def test_refresh_error_classification_matches_manager(settings, security, failure, outcome, error_type):
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse(401)), ("POST", REFRESH, failure),
+    ])
+    result = validator.validate(_account(security))
+    assert result.outcome == outcome
+    assert result.error_type == error_type
+    assert result.validated_via == "access_token"
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize(("extra", "account_client", "expected_client", "expected_redirect"), [
+    ({"refresh_token_client_id": "rt-client", "oauth_client_id": "oauth-client",
+      "oauth_redirect_uri": "https://callback.example/return"}, "account-client", "rt-client", "https://callback.example/return"),
+    ({"oauth_client_id": "oauth-client"}, "account-client", "oauth-client", "http://localhost:1455/auth/callback"),
+    ({}, "account-client", "account-client", "http://localhost:1455/auth/callback"),
+    ({}, None, "default-client", "http://localhost:1455/auth/callback"),
+    ({"refresh_token_client_id": PLATFORM_OAUTH_CLIENT_ID, "oauth_redirect_uri": "https://ignored.example"},
+     "account-client", PLATFORM_OAUTH_CLIENT_ID, None),
+    ({}, PLATFORM_OAUTH_CLIENT_ID, PLATFORM_OAUTH_CLIENT_ID, None),
+])
+def test_refresh_client_and_redirect_resolution(settings, security, extra, account_client, expected_client, expected_redirect):
+    settings = replace(settings, oauth_client_id="default-client",
+                       oauth_redirect_uri="http://localhost:1455/auth/callback")
+    validator, sessions = _remote_validator(settings, security, [_refresh_success(), *_success()])
+    result = validator.validate(_account(security, access_token="", extra_data=extra, client_id=account_client))
+    assert result.outcome == "valid"
+    data = sessions.calls[0]["data"]
+    assert data["client_id"] == expected_client
+    assert data.get("redirect_uri") == expected_redirect
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize(("mode", "explicit", "expected"), [
+    ("direct", None, None), ("account", None, "http://account.example:8080"),
+    ("pool", None, "http://pool.example:8080"),
+    ("direct", "http://override.example:8080", "http://override.example:8080"),
+    ("unknown", None, None),
+])
+def test_exit_selection_is_shared_by_checks_refresh_and_retries(settings, security, monkeypatch, mode, explicit, expected):
+    choices = []
+    def choose(pool):
+        choices.append(pool)
+        return pool[0]
+    monkeypatch.setattr("app.services.validator.random.choice", choose)
+    validator, sessions = _remote_validator(replace(
+        settings, validation_egress_mode=mode, validation_proxy="http://global.example:8080",
+        validation_proxy_pool="http://pool.example:8080,http://other.example:8080",
+    ), security, [
+        ("GET", USERINFO, FakeResponse(429)), ("GET", USERINFO, FakeResponse(401)),
+        _refresh_success(), *_success(),
+    ])
+    result = validator.validate(_account(security, extra_data={"proxy_url": "http://account.example:8080"}),
+                                validation_proxy=explicit)
+    assert result.outcome == "valid"
+    for call in sessions.calls:
+        if expected:
+            assert call["proxies"] == {"http": expected, "https": expected}
+        else:
+            assert "proxies" not in call
+    assert len(choices) == (1 if mode == "pool" and not explicit else 0)
+    sessions.assert_complete()
+
+
+def test_missing_both_credentials_is_invalid_without_network(settings, security):
+    validator, sessions = _remote_validator(settings, security, [])
+    result = validator.validate(_account(security, access_token="", refresh_token=""))
+    assert result.outcome == "invalid"
+    assert not sessions.calls
+
+
+def test_diagnostic_messages_do_not_persist_echoed_credentials(settings, client, security):
+    failure = FakeResponse(503, text="old-access-token old-refresh-token new-access-token new-refresh-token new-id-token")
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse(401)), _refresh_success(),
+        *[("GET", USERINFO, failure)] * 3,
+    ])
+    with client.app.state.session_factory.begin() as session:
+        account = _account(security)
+        session.add(account)
+        session.flush()
+        result = apply_validation(session, account, validator)
+        session.flush()
+        attempt = session.query(ValidationAttempt).filter_by(account_id=account.id).one()
+        diagnostic = json.dumps(validation_result_details(result)) + result.message + attempt.message
+        for credential in ("old-access-token", "old-refresh-token", "new-access-token", "new-refresh-token", "new-id-token"):
+            assert credential not in diagnostic
+    sessions.assert_complete()
+
+
+def test_refresh_normalizes_jwt_artifacts_without_plaintext_credentials_in_metadata(settings, client, security):
+    from app.services.token_artifacts import build_compat_id_token, decode_jwt_payload
+
+    access_token = build_compat_id_token(
+        email="person@example.com", exp=2000000000,
+        account_id="refreshed-account", user_id="chatgpt-user", plan_type="plus",
+    )
+    validator, sessions = _remote_validator(settings, security, [
+        ("GET", USERINFO, FakeResponse(401)),
+        ("POST", REFRESH, FakeResponse(payload={
+            "access_token": access_token, "refresh_token": "rotated-rt", "expires_in": 3600,
+        })), *_success(),
+    ])
+    with client.app.state.session_factory.begin() as session:
+        account = _account(
+            security, extra_data={"oauth_client_id": "metadata-client",
+                                  "credentials": {"session_token": "saved-session"},
+                                  "proxy_used": "http://historical.example:8080"},
+        )
+        session.add(account)
+        session.flush()
+        result = apply_validation(session, account, validator)
+        assert result.outcome == "valid"
+        assert result.refreshed_access_token_valid is True
+        assert result.current_access_token_valid is False
+        assert account.account_id == account.workspace_id == "refreshed-account"
+        assert account.proxy_used is None
+        assert security.decrypt(account.session_token_encrypted) == "saved-session"
+        compat_id = security.decrypt(account.id_token_encrypted)
+        assert decode_jwt_payload(compat_id)["https://api.openai.com/auth"]["chatgpt_account_id"] == "refreshed-account"
+        metadata = json.loads(account.extra_data)
+        assert metadata["plan_type"] == "plus"
+        assert metadata["oauth_client_id"] == "metadata-client"
+        assert metadata["token_artifacts"]["chatgpt_user_id"] == "chatgpt-user"
+        assert "proxy_used" not in metadata
+        for credential in (access_token, "rotated-rt", "saved-session", compat_id):
+            assert credential not in account.extra_data
+        assert "session_token" not in metadata["credentials"]
+        assert "id_token" not in metadata["token_artifacts"]
+    sessions.assert_complete()
+
+
+def test_current_at_diagnostic_redacts_all_known_credentials(settings, security):
+    failure = FakeResponse(503, text="old-access-token old-refresh-token")
+    validator, sessions = _remote_validator(settings, security, [("GET", USERINFO, failure)] * 3)
+    result = validator.validate(_account(security))
+    assert "old-access-token" not in json.dumps(validation_result_details(result))
+    assert "old-refresh-token" not in result.message
+    sessions.assert_complete()
+
+
+def test_redaction_precedes_upstream_body_truncation(settings, security):
+    token = "long-private-access-token-" * 50
+    failure = FakeResponse(503, text=f"upstream echoed {token}")
+    validator, sessions = _remote_validator(settings, security, [("GET", USERINFO, failure)] * 3)
+    result = validator.validate(_account(security, access_token=token))
+    assert "long-private-access-token" not in result.message
+    assert "[redacted]" in result.current_access_token_error
     sessions.assert_complete()

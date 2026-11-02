@@ -310,6 +310,8 @@ class AccountImportService:
                                 message="预验活执行异常",
                             )
                         elif result:
+                            if result.recoverable:
+                                task.recoverable_count += 1
                             if result.outcome == "valid":
                                 task.valid_count += 1
                             elif result.outcome == "invalid":

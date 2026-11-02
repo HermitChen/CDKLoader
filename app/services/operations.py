@@ -120,6 +120,7 @@ def serialize_operation_task(task: OperationTask) -> dict[str, Any]:
         "valid_count": task.valid_count,
         "invalid_count": task.invalid_count,
         "inconclusive_count": task.inconclusive_count,
+        "recoverable_count": task.recoverable_count,
         "skipped_count": task.skipped_count,
         "failed_count": task.failed_count,
         "file_name": task.file_name,

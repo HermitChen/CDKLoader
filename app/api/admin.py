@@ -596,7 +596,7 @@ def _validate_accounts_task(
     task_id: str,
     account_ids: list[str],
     validation_proxy: str | None = None,
-    probe_mode: str = "strict",
+    concurrency: int | None = None,
 ) -> None:
     with factory.begin() as session:
         task = session.get(OperationTask, task_id)
@@ -625,7 +625,6 @@ def _validate_accounts_task(
             result = validator.validate(
                 account,
                 validation_proxy=validation_proxy,
-                probe_mode=probe_mode,
             )
             with factory.begin() as session:
                 current = session.get(Account, account_id)
@@ -637,7 +636,7 @@ def _validate_accounts_task(
             return account_id, None, "failed", None
 
     workers = min(
-        max(1, int(getattr(validator.settings, "validation_concurrency", 1))),
+        max(1, min(50, int(concurrency or validator.settings.validation_concurrency))),
         max(1, len(account_ids)),
     )
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="manual-validate") as executor:
@@ -673,6 +672,8 @@ def _validate_accounts_task(
                         message="验活执行异常",
                     )
                 elif result:
+                    if result.recoverable:
+                        task.recoverable_count += 1
                     if result.outcome == "valid":
                         task.valid_count += 1
                     elif result.outcome == "invalid":
@@ -706,6 +707,7 @@ def _validate_accounts_task(
                 "valid_count": task.valid_count,
                 "invalid_count": task.invalid_count,
                 "inconclusive_count": task.inconclusive_count,
+                "recoverable_count": task.recoverable_count,
                 "skipped_count": task.skipped_count,
                 "failed_count": task.failed_count,
             },
@@ -781,7 +783,7 @@ def validate_accounts(
             task.id,
             accepted_ids,
             payload.proxy,
-            payload.probe_mode or "strict",
+            payload.concurrency,
         )
     return JSONResponse(
         content={"accepted": len(accepted_ids), "skipped": skipped},

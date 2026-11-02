@@ -127,6 +127,7 @@ class OperationTask(Base):
     valid_count: Mapped[int] = mapped_column(Integer, default=0)
     invalid_count: Mapped[int] = mapped_column(Integer, default=0)
     inconclusive_count: Mapped[int] = mapped_column(Integer, default=0)
+    recoverable_count: Mapped[int] = mapped_column(Integer, default=0)
     skipped_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)

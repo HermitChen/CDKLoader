@@ -6,6 +6,10 @@ import threading
 import zipfile
 from datetime import timedelta
 
+import pytest
+from sqlalchemy import text
+
+from app.database import apply_compatibility_migrations
 from app.models import OperationLog, OperationTask, utcnow
 from app.services.operations import cleanup_operation_data, export_directory
 from app.services.validator import ValidationResult
@@ -95,6 +99,89 @@ def test_manual_validation_runs_accounts_in_parallel(client, admin_headers, monk
     assert task.json()["status"] == "completed"
     assert task.json()["valid_count"] == 2
     assert task.json()["failed_count"] == 0
+
+
+def test_manual_validation_keeps_manager_result_details_and_recovery_count(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers, count=2)
+    accounts = client.get("/api/v1/admin/accounts", headers=admin_headers, params={"limit": 0}).json()["items"]
+    recovered_id = accounts[0]["id"]
+    def validate(account, **_kwargs):
+        if account.id == recovered_id:
+            return ValidationResult(
+                "valid", validated_via="refresh_token", refreshed=True, recoverable=True,
+                current_access_token_valid=False, current_access_token_error="Token 无效或已过期",
+                current_access_token_error_type="access_token", refreshed_access_token_valid=True,
+            )
+        return ValidationResult(
+            "inconclusive", "transient", "Token 验证暂不可用: HTTP 429",
+            current_access_token_error="Token 验证暂不可用: HTTP 429",
+            current_access_token_error_type="transient",
+        )
+    monkeypatch.setattr(client.app.state.validator, "validate", validate)
+    response = client.post(
+        "/api/v1/admin/accounts/validate", headers=admin_headers,
+        json={"ids": [account["id"] for account in accounts], "concurrency": 1},
+    )
+    assert response.status_code == 200
+    task = client.get(
+        f"/api/v1/admin/operation-tasks/{response.headers['x-operation-task-id']}", headers=admin_headers,
+    ).json()
+    assert task["valid_count"] == task["inconclusive_count"] == task["recoverable_count"] == 1
+    assert task["invalid_count"] == task["failed_count"] == 0
+    recovered = next(log["details"] for log in task["logs"] if log["account_id"] == recovered_id)
+    assert recovered["recoverable"] and recovered["refreshed"]
+    assert not recovered["current_access_token_valid"]
+    assert recovered["refreshed_access_token_valid"]
+    assert recovered["current_access_token_error_type"] == "access_token"
+
+
+def test_per_request_validation_concurrency_overrides_batch_default(client, admin_headers, monkeypatch):
+    _import_accounts(client, admin_headers, count=2)
+    settings_response = client.put(
+        "/api/v1/admin/settings", headers=admin_headers, json={"values": {"validation_concurrency": 1}},
+    )
+    assert settings_response.status_code == 200
+    accounts = client.get("/api/v1/admin/accounts", headers=admin_headers, params={"limit": 0}).json()["items"]
+    barrier = threading.Barrier(2, timeout=2)
+    def validate(_account, **_kwargs):
+        barrier.wait()
+        return ValidationResult("valid")
+    monkeypatch.setattr(client.app.state.validator, "validate", validate)
+    response = client.post(
+        "/api/v1/admin/accounts/validate", headers=admin_headers,
+        json={"ids": [account["id"] for account in accounts], "concurrency": 2},
+    )
+    task = client.get(
+        f"/api/v1/admin/operation-tasks/{response.headers['x-operation-task-id']}", headers=admin_headers,
+    ).json()
+    assert task["valid_count"] == 2
+    assert task["failed_count"] == 0
+
+
+@pytest.mark.parametrize("concurrency", [0, 51])
+def test_batch_validation_rejects_invalid_concurrency(client, admin_headers, concurrency):
+    response = client.post(
+        "/api/v1/admin/accounts/validate", headers=admin_headers,
+        json={"ids": ["unused-account"], "concurrency": concurrency},
+    )
+    assert response.status_code == 422
+
+
+def test_existing_sqlite_tasks_gain_recovery_counter_without_losing_progress(client):
+    with client.app.state.session_factory.begin() as session:
+        task = OperationTask(task_type="manual_validation", valid_count=2, total=2, processed=2)
+        session.add(task)
+        session.flush()
+        task_id = task.id
+        engine = session.get_bind()
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE operation_tasks DROP COLUMN recoverable_count"))
+    apply_compatibility_migrations(engine)
+    apply_compatibility_migrations(engine)
+    with client.app.state.session_factory() as session:
+        migrated = session.get(OperationTask, task_id)
+        assert migrated.valid_count == migrated.processed == 2
+        assert migrated.recoverable_count == 0
 
 
 def test_public_export_task_reports_progress_and_supports_range_download(client, admin_headers):

@@ -21,7 +21,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir "uv==0.11.7"
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md THIRD_PARTY_NOTICES.md ./
 COPY app ./app
 COPY --from=frontend-build /build/app/static ./app/static
 

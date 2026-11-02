@@ -39,7 +39,7 @@ class RedemptionCreateRequest(BaseModel):
 class AccountValidateRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=5000)
     proxy: str | None = Field(default=None, max_length=1024)
-    probe_mode: Literal["fast", "strict"] | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=50)
 
 
 class AccountExportRequest(BaseModel):

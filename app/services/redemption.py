@@ -27,6 +27,7 @@ class RedemptionError(ValueError):
 class ReservedAccount:
     account_id: str
     cdk_id: str
+    previous_status: str = "available"
 
 
 @dataclass
@@ -279,7 +280,7 @@ class RedemptionService:
             query = query.where(email_condition)
         return query.order_by(func.random())
 
-    def _reserve_accounts(self, redemption_id: str, cdk_id: str, desired: int) -> list[str]:
+    def _reserve_accounts(self, redemption_id: str, cdk_id: str, desired: int, excluded: set[str]) -> list[ReservedAccount]:
         if desired <= 0:
             return []
         with self.factory.begin() as session:
@@ -287,14 +288,15 @@ class RedemptionService:
             if not cdk:
                 return []
             candidates = session.scalars(
-                self._account_query(cdk).with_for_update(skip_locked=True).limit(desired)
+                self._account_query(cdk).where(Account.id.not_in(excluded)).with_for_update(skip_locked=True).limit(desired)
             ).all()
+            reserved = [ReservedAccount(account.id, cdk_id, account.status) for account in candidates]
             lease_until = utcnow() + timedelta(minutes=5)
             for account in candidates:
                 account.status = "reserved"
                 account.reserved_by = redemption_id
                 account.reserved_until = lease_until
-            return [account.id for account in candidates]
+            return reserved
 
     def _load_reserved_accounts(self, redemption_id: str, ids: list[str]) -> list[Account]:
         if not ids:
@@ -328,6 +330,7 @@ class RedemptionService:
                     self.validator,
                     result,
                     preserve_reservation=True,
+                    previous_status=by_id[account.id].previous_status,
                 )
                 if result.outcome == "valid":
                     valid.append(by_id[account.id])
@@ -371,14 +374,15 @@ class RedemptionService:
             target_by_cdk = {relation.cdk_id: relation.reserved_quantity for relation in relations}
 
         accepted: dict[str, list[ReservedAccount]] = {cdk_id: [] for cdk_id in target_by_cdk}
+        attempted: set[str] = set()
         for cdk_id, target in target_by_cdk.items():
             while len(accepted[cdk_id]) < target:
                 needed = target - len(accepted[cdk_id])
-                candidate_ids = self._reserve_accounts(redemption_id, cdk_id, needed)
-                if not candidate_ids:
+                reserved = self._reserve_accounts(redemption_id, cdk_id, needed, attempted)
+                if not reserved:
                     self._release_redemption(redemption_id, message="可交付账号库存不足", code="insufficient_stock")
                     return
-                reserved = [ReservedAccount(account_id=item, cdk_id=cdk_id) for item in candidate_ids]
+                attempted.update(item.account_id for item in reserved)
                 accepted[cdk_id].extend(self._validate_reserved(redemption_id, reserved))
 
         with self.factory.begin() as session:

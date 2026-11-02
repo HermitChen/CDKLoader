@@ -47,6 +47,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
     account_columns = {column["name"] for column in inspector.get_columns("accounts")}
     redemption_columns = {column["name"] for column in inspector.get_columns("redemptions")}
     redelivery_columns = {column["name"] for column in inspector.get_columns("redeliveries")}
+    task_columns = {column["name"] for column in inspector.get_columns("operation_tasks")}
     if (
         "code_encrypted" not in cdk_columns
         or "email_type" not in cdk_columns
@@ -55,6 +56,7 @@ def apply_compatibility_migrations(engine: Engine) -> None:
         or "two_factor_encrypted" not in account_columns
         or "export_file_name" not in redemption_columns
         or "export_file_name" not in redelivery_columns
+        or "recoverable_count" not in task_columns
     ):
         with engine.begin() as connection:
             if "code_encrypted" not in cdk_columns:
@@ -71,6 +73,8 @@ def apply_compatibility_migrations(engine: Engine) -> None:
                 connection.execute(text("ALTER TABLE redemptions ADD COLUMN export_file_name VARCHAR(255)"))
             if "export_file_name" not in redelivery_columns:
                 connection.execute(text("ALTER TABLE redeliveries ADD COLUMN export_file_name VARCHAR(255)"))
+            if "recoverable_count" not in task_columns:
+                connection.execute(text("ALTER TABLE operation_tasks ADD COLUMN recoverable_count INTEGER NOT NULL DEFAULT 0"))
 
 
 def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:

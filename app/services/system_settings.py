@@ -67,7 +67,7 @@ def parse_setting_value(key: str, value: Any) -> Any:
         parsed = parsed.rstrip("/")
         if not parsed:
             raise ValueError("公开服务地址不能为空")
-    if key in {"validation_impersonate", "oauth_client_id"} and not parsed:
+    if key == "oauth_client_id" and not parsed:
         raise ValueError(f"参数 {spec.label} 不能为空")
     return parsed
 
