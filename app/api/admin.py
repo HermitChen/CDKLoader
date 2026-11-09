@@ -20,6 +20,8 @@ from ..models import (
     DeliveryItem,
     OperationLog,
     OperationTask,
+    ProxyGroup,
+    ProxyNode,
     Redemption,
     RedemptionCDK,
     utcnow,
@@ -31,6 +33,8 @@ from ..schemas import (
     BulkDeleteRequest,
     CDKGenerateRequest,
     CDKImportRequest,
+    ProxyHealthSettingsUpdate,
+    ProxyGroupUpdate,
     SystemSettingsUpdate,
 )
 from ..security import SecurityManager
@@ -56,7 +60,20 @@ from ..services.operations import (
     start_operation_task,
 )
 from ..services.redemption import refresh_cdk_status, serialize_redemption
-from ..services.system_settings import settings_payload, update_system_settings
+from ..services.proxy_groups import (
+    group_is_referenced,
+    mask_proxy_url,
+    normalize_proxy_url,
+    serialize_proxy_group,
+)
+from ..services.proxy_health import (
+    MANUAL_PROXY_TEST_TIMEOUT_MS,
+    ProxyHealthPolicy,
+    format_probe_error,
+    probe_proxy,
+    save_proxy_health_policy,
+)
+from ..services.system_settings import load_system_settings, settings_payload, update_system_settings
 from ..services.validator import ValidationResult, persist_validation_result, validation_result_details
 from ..time import china_day_bounds_utc, to_china_iso, to_utc_naive
 
@@ -220,6 +237,7 @@ def save_system_settings(
             db,
             request.app.state.settings,
             payload.values,
+            request.app.state.security,
         )
     except ValueError as exc:
         db.rollback()
@@ -228,6 +246,177 @@ def save_system_settings(
     db.commit()
     request.app.state.apply_runtime_settings(updated_settings)
     return settings_payload(updated_settings)
+
+
+def _reload_settings(request: Request, db: Session):
+    updated = load_system_settings(db, request.app.state.settings, request.app.state.security)
+    request.app.state.apply_runtime_settings(updated)
+    return updated
+
+
+def _proxy_group_or_404(db: Session, group_id: str) -> ProxyGroup:
+    group = db.get(ProxyGroup, group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail="代理组不存在")
+    return group
+
+
+def _serialize_proxy_group(group: ProxyGroup, request: Request, db: Session) -> dict:
+    return serialize_proxy_group(
+        group,
+        request.app.state.security,
+        can_delete=not group_is_referenced(db, group.id),
+        health_lookup=request.app.state.proxy_health_monitor.snapshot,
+    )
+
+
+@router.get("/proxy-health/settings", dependencies=[Depends(require_admin)])
+def get_proxy_health_settings(request: Request):
+    return request.app.state.proxy_health_monitor.get_policy().as_dict()
+
+
+@router.put("/proxy-health/settings", dependencies=[Depends(require_admin)])
+def update_proxy_health_settings(
+    payload: ProxyHealthSettingsUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    policy = ProxyHealthPolicy(
+        enabled=payload.enabled,
+        interval_minutes=payload.interval_minutes,
+        threshold_ms=payload.threshold_ms,
+    )
+    save_proxy_health_policy(db, policy)
+    db.commit()
+    request.app.state.proxy_health_monitor.set_policy(policy)
+    return policy.as_dict()
+
+
+@router.get("/proxy-groups", dependencies=[Depends(require_admin)])
+def list_proxy_groups(request: Request, db: Session = Depends(get_db)):
+    groups = db.scalars(select(ProxyGroup).options(selectinload(ProxyGroup.nodes)).order_by(ProxyGroup.name, ProxyGroup.id)).all()
+    return {"groups": [_serialize_proxy_group(group, request, db) for group in groups]}
+
+
+@router.post("/proxy-groups", dependencies=[Depends(require_admin)])
+def create_proxy_group(
+    payload: ProxyGroupUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="代理组名称不能为空")
+    if db.scalar(select(ProxyGroup).where(ProxyGroup.name == name)):
+        raise HTTPException(status_code=409, detail="代理组名称已存在")
+    group = ProxyGroup(
+        name=name,
+        strategy=payload.strategy,
+        rotation_interval_minutes=payload.rotation_interval_minutes,
+        enabled=payload.enabled,
+    )
+    for position, item in enumerate(payload.nodes):
+        try:
+            normalized = normalize_proxy_url(item.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        group.nodes.append(
+            ProxyNode(
+                name=item.name.strip() or f"节点 {position + 1}",
+                url_encrypted=request.app.state.security.encrypt(normalized),
+                url_display=mask_proxy_url(normalized),
+                enabled=item.enabled,
+                position=position,
+            )
+        )
+    db.add(group)
+    db.flush()
+    db.commit()
+    _reload_settings(request, db)
+    return {"group": _serialize_proxy_group(group, request, db)}
+
+
+@router.put("/proxy-groups/{group_id}", dependencies=[Depends(require_admin)])
+def update_proxy_group(
+    group_id: str,
+    payload: ProxyGroupUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    group = _proxy_group_or_404(db, group_id)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="代理组名称不能为空")
+    duplicate = db.scalar(select(ProxyGroup).where(ProxyGroup.name == name, ProxyGroup.id != group_id))
+    if duplicate:
+        raise HTTPException(status_code=409, detail="代理组名称已存在")
+    referenced = group_is_referenced(db, group_id)
+    if referenced and not payload.enabled:
+        raise HTTPException(status_code=409, detail="当前选中的代理组不能停用")
+    if referenced and not any(item.enabled for item in payload.nodes):
+        raise HTTPException(status_code=409, detail="当前选中的代理组至少需要一个启用节点")
+    existing = {node.id: node for node in group.nodes}
+    next_nodes: list[ProxyNode] = []
+    for position, item in enumerate(payload.nodes):
+        current = existing.get(item.id or "")
+        try:
+            submitted = normalize_proxy_url(item.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if current and not item.clear_credentials and item.url.strip() == current.url_display:
+            encrypted = current.url_encrypted
+            display = current.url_display
+        else:
+            encrypted = request.app.state.security.encrypt(submitted)
+            display = mask_proxy_url(submitted)
+        next_nodes.append(
+            ProxyNode(
+                id=current.id if current else None,
+                name=item.name.strip() or f"节点 {position + 1}",
+                url_encrypted=encrypted,
+                url_display=display,
+                enabled=item.enabled,
+                position=position,
+            )
+        )
+    group.name = name
+    group.strategy = payload.strategy
+    group.rotation_interval_minutes = payload.rotation_interval_minutes
+    group.enabled = payload.enabled
+    group.nodes = next_nodes
+    db.flush()
+    db.commit()
+    _reload_settings(request, db)
+    return {"group": _serialize_proxy_group(group, request, db)}
+
+
+@router.post("/proxy-groups/{group_id}/nodes/{node_id}/test", dependencies=[Depends(require_admin)])
+def test_proxy_node(group_id: str, node_id: str, request: Request, db: Session = Depends(get_db)):
+    group = _proxy_group_or_404(db, group_id)
+    node = next((item for item in group.nodes if item.id == node_id), None)
+    if node is None:
+        raise HTTPException(status_code=404, detail="代理节点不存在")
+    proxy_url = request.app.state.security.decrypt(node.url_encrypted)
+    result = probe_proxy(proxy_url, timeout_ms=MANUAL_PROXY_TEST_TIMEOUT_MS)
+    payload = result.as_dict()
+    # Match FlowRealm's manual connectivity test: target responses below 500
+    # prove the proxy route works, even when the target returns 3xx or 4xx.
+    payload["ok"] = result.status_code is not None and result.status_code < 500
+    payload["error_code"] = result.error_code
+    payload["error"] = format_probe_error(result)
+    payload["inconclusive"] = result.inconclusive
+    return {"result": payload}
+
+
+@router.delete("/proxy-groups/{group_id}", dependencies=[Depends(require_admin)])
+def delete_proxy_group(group_id: str, request: Request, db: Session = Depends(get_db)):
+    group = _proxy_group_or_404(db, group_id)
+    if group_is_referenced(db, group_id):
+        raise HTTPException(status_code=409, detail="当前选中的代理组不能删除")
+    db.delete(group)
+    db.commit()
+    _reload_settings(request, db)
+    return {"deleted": group_id}
 
 
 @router.get("/operation-tasks", dependencies=[Depends(require_admin)])

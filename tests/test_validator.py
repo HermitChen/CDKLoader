@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 import pytest
+from curl_cffi.requests.exceptions import ProxyError, Timeout as CurlTimeout
 
 from app.models import Account, ValidationAttempt, utcnow
 from app.security import SecurityManager
@@ -117,6 +118,42 @@ def _success():
     return [("GET", USERINFO, FakeResponse()), ("POST", INIT, FakeResponse()), ("GET", CHECK, FakeResponse())]
 
 
+@pytest.mark.parametrize("failure", [
+    pytest.param(CurlTimeout("proxy connection timed out"), id="curl-timeout"),
+    pytest.param(ProxyError("proxy connection failed"), id="proxy-error"),
+    pytest.param(FakeResponse(504), id="gateway-timeout"),
+])
+def test_proxy_timeout_retries_validation_direct_and_keeps_direct_for_chain(settings, security, failure):
+    proxy = "http://validation-proxy.example:8080"
+    validator, sessions = _remote_validator(replace(
+        settings, validation_egress_mode="account", validation_proxy=proxy,
+    ), security, [("GET", USERINFO, failure), *_success()])
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "valid"
+    assert sessions.calls[0]["proxies"] == {"http": proxy, "https": proxy}
+    assert all("proxies" not in call for call in sessions.calls[1:])
+    assert [call["url"] for call in sessions.calls] == [USERINFO, USERINFO, INIT, CHECK]
+    sessions.assert_complete()
+
+
+def test_ambiguous_refresh_timeout_does_not_replay_one_time_token(settings, security):
+    proxy = "http://validation-proxy.example:8080"
+    validator, sessions = _remote_validator(replace(
+        settings, validation_egress_mode="account", validation_proxy=proxy,
+    ), security, [("GET", USERINFO, FakeResponse(401)),
+                  ("POST", REFRESH, CurlTimeout("read timed out"))])
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "inconclusive"
+    assert result.error_type == "transient"
+    assert len(sessions.calls) == 2
+    assert all(call["proxies"] == {"http": proxy, "https": proxy} for call in sessions.calls)
+    sessions.assert_complete()
+
+
 def _refresh_success():
     return ("POST", REFRESH, FakeResponse(payload={
         "access_token": "new-access-token", "refresh_token": "new-refresh-token",
@@ -170,10 +207,26 @@ def test_browser_profile_and_user_agent_follow_installed_curl(settings, security
     monkeypatch.setattr("app.services.validator.cffi_requests.Session", lambda **kwargs: captured.append(kwargs))
     validator = TokenValidator(settings, security)
     validator._session()
-    assert captured == [{"impersonate": latest_chrome_impersonate()}]
+    assert captured == [{"impersonate": latest_chrome_impersonate(), "trust_env": False}]
     assert CHATGPT_VALIDATION_IMPERSONATE == latest_chrome_impersonate()
     major = re.fullmatch(r"chrome(\d+)[a-z_]*", CHATGPT_VALIDATION_IMPERSONATE)[1]
     assert f"Chrome/{major}.0.0.0" in CHATGPT_VALIDATION_USER_AGENT
+
+
+def test_socks5_validation_resolves_target_at_proxy_for_the_entire_chain(settings, security):
+    proxy = "socks5://user:secret%40encoded@proxy.example:1080"
+    validator, sessions = _remote_validator(replace(
+        settings, validation_egress_mode="account", validation_proxy=proxy,
+    ), security, _success())
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "valid"
+    assert all(call["proxies"] == {
+        "http": proxy.replace("socks5://", "socks5h://", 1),
+        "https": proxy.replace("socks5://", "socks5h://", 1),
+    } for call in sessions.calls)
+    sessions.assert_complete()
 
 
 @pytest.mark.parametrize("stage", ["userinfo", "conversation/init", "accounts/check"])
@@ -377,7 +430,6 @@ def test_refresh_client_and_redirect_resolution(settings, security, extra, accou
 
 @pytest.mark.parametrize(("mode", "explicit", "expected"), [
     ("direct", None, None), ("account", None, "http://account.example:8080"),
-    ("pool", None, "http://pool.example:8080"),
     ("direct", "http://override.example:8080", "http://override.example:8080"),
     ("unknown", None, None),
 ])
@@ -389,7 +441,6 @@ def test_exit_selection_is_shared_by_checks_refresh_and_retries(settings, securi
     monkeypatch.setattr("app.services.validator.random.choice", choose)
     validator, sessions = _remote_validator(replace(
         settings, validation_egress_mode=mode, validation_proxy="http://global.example:8080",
-        validation_proxy_pool="http://pool.example:8080,http://other.example:8080",
     ), security, [
         ("GET", USERINFO, FakeResponse(429)), ("GET", USERINFO, FakeResponse(401)),
         _refresh_success(), *_success(),
@@ -402,7 +453,7 @@ def test_exit_selection_is_shared_by_checks_refresh_and_retries(settings, securi
             assert call["proxies"] == {"http": expected, "https": expected}
         else:
             assert "proxies" not in call
-    assert len(choices) == (1 if mode == "pool" and not explicit else 0)
+    assert not choices
     sessions.assert_complete()
 
 

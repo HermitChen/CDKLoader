@@ -63,6 +63,53 @@ class SystemSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class ProxyGroup(Base):
+    __tablename__ = "proxy_groups"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    strategy: Mapped[str] = mapped_column(String(32), default="request_random")
+    rotation_interval_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    nodes: Mapped[list["ProxyNode"]] = relationship(
+        back_populates="group",
+        cascade="all, delete-orphan",
+        order_by="ProxyNode.position",
+    )
+
+
+class ProxyNode(Base):
+    __tablename__ = "proxy_nodes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    group_id: Mapped[str] = mapped_column(ForeignKey("proxy_groups.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100), default="")
+    url_encrypted: Mapped[str] = mapped_column(Text)
+    url_display: Mapped[str] = mapped_column(String(1024))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+
+    group: Mapped[ProxyGroup] = relationship(back_populates="nodes")
+
+
+class ProxyNodeHealth(Base):
+    __tablename__ = "proxy_node_health"
+
+    node_id: Mapped[str] = mapped_column(ForeignKey("proxy_nodes.id", ondelete="CASCADE"), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str] = mapped_column(String(64), default="")
+    blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_successes: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class Account(Base):
     __tablename__ = "accounts"
 

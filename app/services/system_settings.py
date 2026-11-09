@@ -16,6 +16,8 @@ from ..config import (
     parse_size_bytes,
 )
 from ..models import SystemSetting
+from ..security import SecurityManager
+from .proxy_groups import load_proxy_groups, proxy_group_options
 
 
 def _spec(key: str) -> RuntimeSettingSpec:
@@ -110,7 +112,11 @@ def ensure_system_settings(session: Session, settings: Settings) -> None:
     session.flush()
 
 
-def load_system_settings(session: Session, base_settings: Settings) -> Settings:
+def load_system_settings(
+    session: Session,
+    base_settings: Settings,
+    security: SecurityManager | None = None,
+) -> Settings:
     rows = _setting_rows(session)
     overrides: dict[str, Any] = {}
     for spec in RUNTIME_SETTING_SPECS:
@@ -118,11 +124,16 @@ def load_system_settings(session: Session, base_settings: Settings) -> Settings:
         if not row:
             continue
         try:
-            overrides[spec.key] = parse_setting_value(spec.key, row.value)
+            stored_value = row.value
+            if spec.key == "validation_egress_mode" and stored_value.strip().lower() == "pool":
+                stored_value = "direct"
+            overrides[spec.key] = parse_setting_value(spec.key, stored_value)
         except ValueError:
             # A hand-edited database value must not prevent the service from
             # starting. The API will reject the value if it is submitted again.
             continue
+    if security is not None:
+        overrides["validation_proxy_groups"] = load_proxy_groups(session, security)
     return replace(base_settings, **overrides)
 
 
@@ -130,18 +141,33 @@ def update_system_settings(
     session: Session,
     base_settings: Settings,
     values: dict[str, Any],
+    security: SecurityManager | None = None,
 ) -> Settings:
     rows = _setting_rows(session)
+    egress_mode: str | None = None
     for key, value in values.items():
         normalized = _storage_value(key, value)
+        if key == "validation_egress_mode":
+            egress_mode = normalized
+        if key == "validation_proxy_group_id" and normalized:
+            groups = load_proxy_groups(session, security) if security is not None else base_settings.validation_proxy_groups
+            group = next((item for item in groups if item.id == normalized), None)
+            if group is None:
+                raise ValueError("参数 验活代理组不存在")
+            if not group.enabled or not any(node.enabled and node.url for node in group.nodes):
+                raise ValueError("参数 验活代理组当前没有可用节点")
         row = rows.get(key)
         if row:
             row.value = normalized
         else:
             row = SystemSetting(key=key, value=normalized)
             session.add(row)
+    if egress_mode is not None and egress_mode != "group":
+        group_row = rows.get("validation_proxy_group_id")
+        if group_row:
+            group_row.value = ""
     session.flush()
-    return load_system_settings(session, base_settings)
+    return load_system_settings(session, base_settings, security)
 
 
 def settings_payload(settings: Settings) -> dict[str, Any]:
@@ -151,6 +177,12 @@ def settings_payload(settings: Settings) -> dict[str, Any]:
             spec.group,
             {"key": spec.group, "label": spec.group_label, "items": []},
         )
+        options = [
+            {"label": label, "value": value}
+            for label, value in spec.options
+        ]
+        if spec.value_type == "proxy_group":
+            options = [{"label": "不选择代理组", "value": ""}] + proxy_group_options(settings.validation_proxy_groups)
         group["items"].append(
             {
                 "key": spec.key,
@@ -162,10 +194,7 @@ def settings_payload(settings: Settings) -> dict[str, Any]:
                 "min": spec.min_value,
                 "max": spec.max_value,
                 "unit": spec.unit,
-                "options": [
-                    {"label": label, "value": value}
-                    for label, value in spec.options
-                ],
+                "options": options,
             }
         )
     return {"groups": list(grouped.values())}

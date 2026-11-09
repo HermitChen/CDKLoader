@@ -81,6 +81,24 @@ class RuntimeSettingSpec:
     options: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class ProxyNodeSetting:
+    id: str
+    name: str
+    url: str
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ProxyGroupSetting:
+    id: str
+    name: str
+    strategy: str
+    rotation_interval_minutes: int
+    enabled: bool
+    nodes: tuple[ProxyNodeSetting, ...]
+
+
 RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
     RuntimeSettingSpec(
         "account_auto_delete_days",
@@ -162,7 +180,7 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         options=(
             ("直连", "direct"),
             ("账号代理", "account"),
-            ("代理池", "pool"),
+            ("代理组", "group"),
         ),
     ),
     RuntimeSettingSpec(
@@ -175,12 +193,12 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         "",
     ),
     RuntimeSettingSpec(
-        "validation_proxy_pool",
+        "validation_proxy_group_id",
         "validation",
         "验活",
-        "代理池",
-        "多个代理可用逗号、分号或换行分隔",
-        "string",
+        "验活代理组",
+        "代理组模式下，远端验活从所选组中选择节点",
+        "proxy_group",
         "",
     ),
     RuntimeSettingSpec(
@@ -299,8 +317,9 @@ class Settings:
     export_retention_seconds: int = 86400
     export_dir: str = ""
     validation_proxy: str = ""
-    validation_proxy_pool: str = ""
     validation_egress_mode: str = "direct"
+    validation_proxy_group_id: str = ""
+    validation_proxy_groups: tuple[ProxyGroupSetting, ...] = ()
     account_auto_delete_days: int = 30
     exhausted_cdk_auto_delete_days: int = 30
 
@@ -334,8 +353,8 @@ def get_settings() -> Settings:
         export_retention_seconds=max(300, int(os.getenv("EXPORT_RETENTION_SECONDS", "86400"))),
         export_dir=os.getenv("EXPORT_DIR", str(PROJECT_ROOT / "data" / "exports")),
         validation_proxy=os.getenv("VALIDATION_PROXY", "").strip(),
-        validation_proxy_pool=os.getenv("VALIDATION_PROXY_POOL", "").strip(),
         validation_egress_mode=os.getenv("VALIDATION_EGRESS_MODE", "direct").strip().lower(),
+        validation_proxy_group_id="",
         account_auto_delete_days=max(0, int(os.getenv("ACCOUNT_AUTO_DELETE_DAYS", "30"))),
         exhausted_cdk_auto_delete_days=max(
             0, int(os.getenv("EXHAUSTED_CDK_AUTO_DELETE_DAYS", "30"))

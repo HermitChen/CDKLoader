@@ -52,3 +52,25 @@ class BulkDeleteRequest(BaseModel):
 
 class SystemSettingsUpdate(BaseModel):
     values: dict[str, Any] = Field(min_length=1, max_length=64)
+
+
+class ProxyNodeUpdate(BaseModel):
+    id: str | None = Field(default=None, max_length=36)
+    name: str = Field(default="", max_length=100)
+    url: str = Field(min_length=1, max_length=1024)
+    enabled: bool = True
+    clear_credentials: bool = False
+
+
+class ProxyGroupUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    strategy: Literal["request_random", "round_robin", "time_window"] = "request_random"
+    rotation_interval_minutes: int = Field(default=0, ge=0, le=1440)
+    enabled: bool = True
+    nodes: list[ProxyNodeUpdate] = Field(min_length=1, max_length=256)
+
+
+class ProxyHealthSettingsUpdate(BaseModel):
+    enabled: bool = True
+    interval_minutes: int = Field(default=5, ge=1, le=30)
+    threshold_ms: int = Field(default=1000, ge=1, le=60000)

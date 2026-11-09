@@ -17,7 +17,10 @@ from typing import Any
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests.impersonate import resolve_latest_browser_type
+from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
+from curl_cffi.requests.exceptions import ProxyError, Timeout as CurlTimeout
 
+from .proxy_transport import proxy_request_mapping
 from .token_artifacts import normalize_token_artifacts
 
 
@@ -141,11 +144,66 @@ class TokenRefreshManager:
         self.sensitive_credentials: tuple[str, ...] = ()
 
     def _create_session(self):
-        return cffi_requests.Session(impersonate=CHATGPT_VALIDATION_IMPERSONATE)
+        return cffi_requests.Session(impersonate=CHATGPT_VALIDATION_IMPERSONATE, trust_env=False)
 
     def _proxy_mapping(self) -> dict[str, str] | None:
-        proxy = str(self.proxy_url or "").strip()
-        return {"http": proxy, "https": proxy} if proxy else None
+        return proxy_request_mapping(self.proxy_url)
+
+    @staticmethod
+    def _should_fallback_to_direct(
+        proxy_url: str | None,
+        stage: str,
+        *,
+        error: Exception | None = None,
+        status_code: int | None = None,
+    ) -> bool:
+        if not str(proxy_url or "").strip():
+            return False
+        if status_code is not None:
+            return stage != "refresh_token" and status_code in {408, 502, 503, 504}
+        if error is None:
+            return False
+        if isinstance(error, ProxyError):
+            return True
+
+        detail = str(error).lower()
+        if stage == "refresh_token":
+            return "proxy" in detail and any(
+                marker in detail for marker in ("timeout", "timed out", "connect", "tunnel")
+            )
+        return isinstance(error, (CurlConnectionError, CurlTimeout, TimeoutError)) or any(
+            marker in detail
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection reset",
+                "connection refused",
+                "connect tunnel failed",
+                "tunnel failed",
+                "could not resolve proxy",
+                "failed to connect to proxy",
+            )
+        )
+
+    def _retry_direct(
+        self,
+        session: Any,
+        method: str,
+        url: str,
+        *,
+        stage: str,
+        headers: dict[str, str],
+        kwargs: dict[str, Any],
+    ):
+        self.proxy_url = None
+        return self._request(
+            session,
+            method,
+            url,
+            stage=stage,
+            headers=headers,
+            **{key: value for key, value in kwargs.items() if key != "proxies"},
+        )
 
     @staticmethod
     def _close_session(session: Any) -> None:
@@ -198,13 +256,30 @@ class TokenRefreshManager:
         return f"{error} - {detail[:200]}" if detail else error
 
     def _request(self, session: Any, method: str, url: str, *, stage: str, headers: dict[str, str], **kwargs: Any):
-        # Diagnostics are added without changing the source request or retry policy.
+        # Keep diagnostics scoped to the most recent request attempt.
         attempts = int(self.validation_details.get("attempts", 0)) + 1
         self.validation_details = {"stage": stage, "attempts": attempts}
         proxy_mapping = self._proxy_mapping()
+        request_kwargs = dict(kwargs)
+        request_kwargs.pop("proxies", None)
         if proxy_mapping:
-            kwargs["proxies"] = proxy_mapping
-        response = getattr(session, method)(url, headers=headers, timeout=30, **kwargs)
+            request_kwargs["proxies"] = proxy_mapping
+        try:
+            response = getattr(session, method)(url, headers=headers, timeout=30, **request_kwargs)
+        except Exception as exc:
+            if self._should_fallback_to_direct(self.proxy_url, stage, error=exc):
+                return self._retry_direct(
+                    session, method, url, stage=stage, headers=headers, kwargs=kwargs,
+                )
+            raise
+        if self._should_fallback_to_direct(
+            self.proxy_url,
+            stage,
+            status_code=int(getattr(response, "status_code", 0) or 0),
+        ):
+            return self._retry_direct(
+                session, method, url, stage=stage, headers=headers, kwargs=kwargs,
+            )
         response_headers = {
             str(name).lower(): value
             for name, value in (getattr(response, "headers", None) or {}).items()

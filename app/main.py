@@ -17,6 +17,7 @@ from .security import SecurityManager
 from .services.import_service import AccountImportService
 from .services.export_tasks import ExportTaskService
 from .services.operations import cleanup_inventory_data, cleanup_operation_data, mark_interrupted_tasks
+from .services.proxy_health import ProxyHealthMonitor
 from .services.redemption import RedemptionService
 from .services.system_settings import ensure_system_settings, load_system_settings
 from .services.validator import TokenValidator
@@ -28,7 +29,7 @@ STATIC_DIR = PROJECT_ROOT / "app" / "static"
 
 def _apply_runtime_settings(app: FastAPI, settings: Settings) -> None:
     """Refresh settings-dependent services after a database update."""
-    validator = TokenValidator(settings, app.state.security)
+    validator = TokenValidator(settings, app.state.security, app.state.proxy_health_monitor)
     app.state.settings = settings
     app.state.validator = validator
     app.state.import_service.validator = validator
@@ -41,7 +42,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
     engine, session_factory = create_database(resolved_settings)
     security = SecurityManager(resolved_settings.credential_secret, resolved_settings.cdk_pepper)
-    validator = TokenValidator(resolved_settings, security)
+    proxy_health_monitor = ProxyHealthMonitor(session_factory, security)
+    validator = TokenValidator(resolved_settings, security, proxy_health_monitor)
     import_service = AccountImportService(security, validator)
     redemption_service = RedemptionService(session_factory, security, validator)
     export_service = ExportTaskService(session_factory, security, resolved_settings)
@@ -52,7 +54,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         apply_compatibility_migrations(engine)
         with session_factory.begin() as session:
             ensure_system_settings(session, resolved_settings)
-            runtime_settings = load_system_settings(session, resolved_settings)
+            runtime_settings = load_system_settings(session, resolved_settings, security)
+        proxy_health_monitor.load()
         _apply_runtime_settings(app, runtime_settings)
 
         interrupted = await asyncio.to_thread(mark_interrupted_tasks, session_factory, runtime_settings)
@@ -71,11 +74,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.to_thread(cleanup_operation_data, session_factory, current_settings)
                 await asyncio.to_thread(cleanup_inventory_data, session_factory, current_settings)
 
+        async def proxy_health_loop() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(proxy_health_monitor.run_once)
+                except Exception:
+                    logger.warning("proxy health scan failed")
+                await asyncio.sleep(5)
+
         maintenance_task = asyncio.create_task(maintenance_loop())
+        proxy_health_task = asyncio.create_task(proxy_health_loop())
         yield
         maintenance_task.cancel()
+        proxy_health_task.cancel()
         try:
-            await maintenance_task
+            await asyncio.gather(maintenance_task, proxy_health_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         engine.dispose()
@@ -85,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.security = security
+    app.state.proxy_health_monitor = proxy_health_monitor
     app.state.validator = validator
     app.state.import_service = import_service
     app.state.redemption_service = redemption_service
@@ -96,7 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Prefer"],
     )
     app.include_router(admin.router)

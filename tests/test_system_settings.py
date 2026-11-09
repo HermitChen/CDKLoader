@@ -13,7 +13,7 @@ from app.models import (
     utcnow,
 )
 from app.services.operations import cleanup_inventory_data, cleanup_operation_data
-from app.services.system_settings import load_system_settings
+from app.services.system_settings import load_system_settings, settings_payload
 
 
 def _setting_values(payload: dict) -> dict:
@@ -49,6 +49,9 @@ def test_system_settings_are_persisted_and_applied_immediately(client, admin_hea
     values = _setting_values(response.json())
     assert values["account_auto_delete_days"] == 30
     assert values["operation_log_retention_days"] == 30
+    assert "validation_proxy_pool" not in values
+    egress_modes = next(item for group in response.json()["groups"] for item in group["items"] if item["key"] == "validation_egress_mode")
+    assert [option["value"] for option in egress_modes["options"]] == ["direct", "account", "group"]
 
     updated = client.put(
         "/api/v1/admin/settings",
@@ -78,6 +81,16 @@ def test_system_settings_are_persisted_and_applied_immediately(client, admin_hea
         stored = session.get(SystemSetting, "account_auto_delete_days")
         assert stored is not None
         assert stored.value == "14"
+
+
+def test_removed_proxy_pool_setting_is_not_exposed_and_legacy_mode_falls_back(client, settings):
+    with client.app.state.session_factory.begin() as session:
+        session.add(SystemSetting(key="validation_proxy_pool", value="http://legacy.example:8080"))
+        session.get(SystemSetting, "validation_egress_mode").value = "pool"
+        loaded = load_system_settings(session, settings)
+
+    assert loaded.validation_egress_mode == "direct"
+    assert "validation_proxy_pool" not in _setting_values(settings_payload(loaded))
 
 
 def test_runtime_settings_update_health_and_cors(client, admin_headers):

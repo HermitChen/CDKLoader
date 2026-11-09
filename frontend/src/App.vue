@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
+  Activity,
   Archive,
   ChevronLeft,
   ChevronRight,
@@ -15,9 +16,11 @@ import {
   ListChecks,
   LoaderCircle,
   Mail,
+  Network,
   LockKeyhole,
   LogOut,
   PackageOpen,
+  Plus,
   RefreshCw,
   Save,
   Settings2,
@@ -82,6 +85,8 @@ let operationTaskDetailPollTimer = null
 let operationTaskDetailRefreshBusy = false
 let operationTaskDetailId = ''
 let operationTaskDetailAbortController = null
+let proxyHealthPollTimer = null
+let proxyHealthPollBusy = false
 const pageSizeOptions = [
   { label: '15 / 页', value: 15 }, { label: '30 / 页', value: 30 },
   { label: '50 / 页', value: 50 }, { label: '100 / 页', value: 100 },
@@ -120,6 +125,24 @@ const systemSettings = ref([])
 const settingsSaving = ref(false)
 const settingsMessage = ref('')
 const settingsError = ref('')
+const proxyGroups = ref([])
+const proxyHealthSettings = ref({ enabled: true, interval_minutes: 5, threshold_ms: 1000 })
+const proxyHealthSettingsSaved = ref({ enabled: true, interval_minutes: 5, threshold_ms: 1000 })
+const proxyHealthSaving = ref(false)
+const proxyHealthTestingKey = ref('')
+const proxyHealthTestResults = ref({})
+const proxyGroupOpen = ref(false)
+const proxyGroupSaving = ref(false)
+const proxyGroupError = ref('')
+const proxyGroupBatchOpen = ref(false)
+const proxyGroupBatchText = ref('')
+const proxyGroupBatchError = ref('')
+const proxyGroupBatchMessage = ref('')
+const proxyGroupDeleteDialog = ref({ open: false, id: '', name: '' })
+const proxyGroupForm = ref({
+  id: '', name: '', strategy: 'request_random', rotation_interval_minutes: 0, enabled: true,
+  nodes: [{ id: '', name: '节点 1', url: '', enabled: true, has_credentials: false }],
+})
 
 const importFiles = ref([])
 const importInput = ref(null)
@@ -148,6 +171,7 @@ const navItems = [
   { id: 'cdks', label: 'CDK', icon: KeyRound },
   { id: 'redemptions', label: '兑换记录', icon: Archive },
   { id: 'logs', label: '任务日志', icon: ScrollText },
+  { id: 'proxies', label: '代理配置', icon: Network },
   { id: 'settings', label: '系统参数', icon: Settings2 },
 ]
 
@@ -196,6 +220,7 @@ const pageMeta = {
   cdks: { title: 'CDK', description: '管理提取码、额度、有效期和已兑换账号。' },
   redemptions: { title: '兑换记录', description: '查看完整 CDK、交付状态和关联账号。' },
   logs: { title: '任务日志', description: '查看验活、导出和导入任务的进度与结果。' },
+  proxies: { title: '代理配置', description: '维护具名代理组和节点，供验活出口选择。' },
   settings: { title: '系统参数', description: '调整运行参数和自动清理策略，修改后立即生效。' },
 }
 
@@ -341,6 +366,8 @@ async function loadAdminData() {
       loadRedemptions(),
       loadOperationTasks(),
       loadOperationLogs(),
+      loadProxyGroups(),
+      loadProxyHealthSettings(),
       loadSettings(),
     ])
   } catch (error) {
@@ -356,6 +383,405 @@ async function loadSettings() {
   const result = await adminRequest('/admin/settings')
   systemSettings.value = result.groups || []
   settingsError.value = ''
+}
+
+async function loadProxyGroups() {
+  const result = await adminRequest('/admin/proxy-groups')
+  proxyGroups.value = result.groups || []
+}
+
+async function loadProxyHealthSettings() {
+  const result = await adminRequest('/admin/proxy-health/settings')
+  proxyHealthSettings.value = {
+    enabled: result.enabled !== false,
+    interval_minutes: Number(result.interval_minutes) || 5,
+    threshold_ms: Number(result.threshold_ms) || 1000,
+  }
+  proxyHealthSettingsSaved.value = { ...proxyHealthSettings.value }
+}
+
+const proxyHealthSettingsDirty = computed(() => (
+  proxyHealthSettings.value.enabled !== proxyHealthSettingsSaved.value.enabled
+  || Number(proxyHealthSettings.value.interval_minutes) !== proxyHealthSettingsSaved.value.interval_minutes
+  || Number(proxyHealthSettings.value.threshold_ms) !== proxyHealthSettingsSaved.value.threshold_ms
+))
+
+async function saveProxyHealthSettings() {
+  proxyHealthSaving.value = true
+  try {
+    const result = await adminRequest('/admin/proxy-health/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: proxyHealthSettings.value.enabled,
+        interval_minutes: Number(proxyHealthSettings.value.interval_minutes),
+        threshold_ms: Number(proxyHealthSettings.value.threshold_ms),
+      }),
+    })
+    proxyHealthSettingsSaved.value = {
+      enabled: result.enabled,
+      interval_minutes: result.interval_minutes,
+      threshold_ms: result.threshold_ms,
+    }
+    proxyHealthSettings.value = { ...proxyHealthSettingsSaved.value }
+    pushToast('success', '检测设置已保存', '代理健康检测参数已立即生效。')
+    await loadProxyGroups()
+  } catch (error) {
+    pushToast('error', '保存检测设置失败', error.message)
+  } finally {
+    proxyHealthSaving.value = false
+  }
+}
+
+function proxyHealthTestKey(groupId, nodeId) {
+  return `${groupId}:${nodeId}`
+}
+
+function proxyNodeHealthLabel(node) {
+  if (!node.enabled) return '节点已停用'
+  if (node.health?.blocked && node.health?.eligible === false) return '已隔离'
+  if (node.health?.blocked) return '隔离已停用'
+  if (node.health?.state === 'healthy') return '可用'
+  if (node.health?.error?.startsWith('probe_target_http_')) return '目标响应异常'
+  if (node.health?.error === 'probe_internal_error') return '检测异常'
+  return '待检测'
+}
+
+function proxyNodeHealthTone(node) {
+  if (node.health?.blocked && node.health?.eligible === false) return 'error'
+  if (node.health?.state === 'healthy' && node.health?.eligible !== false) return 'success'
+  if (!node.enabled) return 'neutral'
+  return 'info'
+}
+
+function proxyNodeHealthSummary(node, groupId) {
+  const testKey = proxyHealthTestKey(groupId, node.id)
+  if (proxyHealthTestingKey.value === testKey) return '手动测活中…'
+  const manual = proxyHealthTestResults.value[testKey]
+  if (manual) {
+    return manual.ok
+      ? `手测连通 ${manual.latency_ms} ms · HTTP ${manual.status || '—'}`
+      : `手测失败 · ${manual.error || '连接失败'}`
+  }
+  const health = node.health || {}
+  if (health.checked_at) {
+    const latency = health.latency_ms === null ? '' : `${health.latency_ms} ms · `
+    const errors = {
+      proxy_connection_timeout: '自动探测超时',
+      proxy_connection_failed: '自动探测连接失败',
+      proxy_dns_failed: '代理域名解析失败',
+      proxy_target_dns_failed: '目标域名解析失败',
+      proxy_authentication_failed: '代理认证失败',
+      proxy_socks_handshake_failed: 'SOCKS 握手或隧道失败',
+      proxy_tls_verification_failed: 'TLS 证书校验失败',
+      proxy_tls_handshake_failed: 'TLS 握手失败',
+      proxy_configuration_invalid: '代理配置无效',
+      probe_internal_error: '检测客户端异常，本次未判定',
+      latency_exceeded: '耗时超阈值',
+    }
+    if (health.error?.startsWith('probe_target_http_')) {
+      const status = health.error.split('_').pop()
+      const recovery = health.blocked ? `未计入恢复 ${health.recovery_successes || 0}/2` : '节点资格保留'
+      return `${latency}目标 HTTP ${status} · ${recovery}`
+    }
+    if (health.blocked && health.eligible === false) {
+      return `${latency}${errors[health.error] || '恢复观察'} · 复测 ${health.recovery_successes || 0}/2`
+    }
+    if (health.state === 'healthy') return `${latency}自动检测 · ${formatDate(health.checked_at)}`
+    if (health.blocked) return `${latency}隔离策略已停用`
+    if (errors[health.error]) return `${latency}${errors[health.error]}`
+  }
+  return '等待自动检测'
+}
+
+async function testProxyNode(group, node) {
+  if (proxyHealthTestingKey.value) return
+  const testKey = proxyHealthTestKey(group.id, node.id)
+  proxyHealthTestingKey.value = testKey
+  const remaining = { ...proxyHealthTestResults.value }
+  delete remaining[testKey]
+  proxyHealthTestResults.value = remaining
+  try {
+    const response = await adminRequest(`/admin/proxy-groups/${group.id}/nodes/${node.id}/test`, { method: 'POST' })
+    proxyHealthTestResults.value = { ...proxyHealthTestResults.value, [testKey]: response.result }
+    if (response.result.ok) {
+      pushToast('success', '代理连通正常', `${response.result.latency_ms} ms · HTTP ${response.result.status}`)
+    } else {
+      pushToast('warning', '代理测活未通过', response.result.error || '连接失败')
+    }
+  } catch (error) {
+    pushToast('error', '代理测活失败', error.message)
+  } finally {
+    proxyHealthTestingKey.value = ''
+  }
+}
+
+function syncProxyHealthPolling() {
+  if (proxyHealthPollTimer) window.clearInterval(proxyHealthPollTimer)
+  proxyHealthPollTimer = null
+  if (!isAdmin.value || !adminToken.value || activeView.value !== 'proxies' || document.hidden) return
+  proxyHealthPollTimer = window.setInterval(async () => {
+    if (proxyHealthPollBusy || document.hidden) return
+    proxyHealthPollBusy = true
+    try {
+      await loadProxyGroups()
+    } catch (error) {
+      if (error instanceof ApiError && /认证/.test(error.message)) logout()
+    } finally {
+      proxyHealthPollBusy = false
+    }
+  }, 30000)
+}
+
+function systemSettingItem(key) {
+  for (const group of systemSettings.value) {
+    const item = group.items?.find((candidate) => candidate.key === key)
+    if (item) return item
+  }
+  return null
+}
+
+function validationEgressMode() {
+  return String(systemSettingItem('validation_egress_mode')?.value || 'direct').trim().toLowerCase()
+}
+
+function isSystemSettingVisible(item) {
+  const mode = validationEgressMode()
+  if (item.key === 'validation_proxy_group_id') return mode === 'group'
+  if (item.key === 'validation_proxy') return mode === 'account'
+  return true
+}
+
+function updateSystemSettingValue(item, value) {
+  item.value = value
+  if (item.key === 'validation_egress_mode' && value !== 'group') {
+    const groupItem = systemSettingItem('validation_proxy_group_id')
+    if (groupItem) groupItem.value = ''
+  }
+  if (item.key === 'validation_proxy_group_id' && value) {
+    const modeItem = systemSettingItem('validation_egress_mode')
+    if (modeItem) modeItem.value = 'group'
+  }
+}
+
+function resetProxyGroupForm(group = null) {
+  proxyGroupBatchOpen.value = false
+  proxyGroupBatchText.value = ''
+  proxyGroupBatchError.value = ''
+  proxyGroupBatchMessage.value = ''
+  if (group) {
+    proxyGroupForm.value = {
+      id: group.id,
+      name: group.name,
+      strategy: group.strategy,
+      rotation_interval_minutes: group.rotation_interval_minutes || 0,
+      enabled: group.enabled !== false,
+      nodes: (group.nodes || []).map((node, index) => ({
+        id: node.id,
+        name: node.name || `节点 ${index + 1}`,
+        url: node.url || '',
+        enabled: node.enabled !== false,
+        has_credentials: node.has_credentials === true,
+      })),
+    }
+  } else {
+    proxyGroupForm.value = {
+      id: '', name: '', strategy: 'request_random', rotation_interval_minutes: 0, enabled: true,
+      nodes: [{ id: '', name: '节点 1', url: '', enabled: true, has_credentials: false }],
+    }
+  }
+  proxyGroupError.value = ''
+  proxyGroupOpen.value = true
+}
+
+function openProxyGroupBatch() {
+  proxyGroupBatchOpen.value = true
+  proxyGroupBatchError.value = ''
+  proxyGroupBatchMessage.value = ''
+}
+
+function closeProxyGroupBatch() {
+  proxyGroupBatchOpen.value = false
+  proxyGroupBatchText.value = ''
+  proxyGroupBatchError.value = ''
+  proxyGroupBatchMessage.value = ''
+}
+
+function proxyUrlKey(value) {
+  const raw = String(value || '').trim()
+  try {
+    const parsed = new URL(raw)
+    return [
+      parsed.protocol.toLowerCase(),
+      parsed.username,
+      parsed.password,
+      parsed.hostname.toLowerCase(),
+      parsed.port,
+    ].join('|')
+  } catch {
+    return raw
+  }
+}
+
+function isProxyUrl(value) {
+  const raw = String(value || '').trim()
+  if (!raw || /\s/.test(raw)) return false
+  try {
+    const parsed = new URL(raw)
+    if (!['http:', 'https:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'].includes(parsed.protocol.toLowerCase())) return false
+    if (!parsed.hostname || (parsed.pathname && parsed.pathname !== '/') || parsed.search || parsed.hash) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function appendProxyGroupBatch() {
+  const lines = proxyGroupBatchText.value.split(/\r?\n/)
+  if (!proxyGroupBatchText.value.trim()) {
+    proxyGroupBatchError.value = '请粘贴代理地址，每行一个。'
+    proxyGroupBatchMessage.value = ''
+    return
+  }
+  const form = proxyGroupForm.value
+  const hasBlankPlaceholder = form.nodes.length === 1 && !form.nodes[0].url.trim()
+  const existingKeys = new Set(form.nodes.filter((node) => node.url.trim()).map((node) => proxyUrlKey(node.url)))
+  const seenKeys = new Set()
+  const additions = []
+  const invalid = []
+  let duplicateCount = 0
+
+  for (const [index, source] of lines.entries()) {
+    const raw = source.trim()
+    if (!raw || raw.startsWith('#')) continue
+    const parts = raw.split(/\s+/)
+    const url = parts.shift() || ''
+    if (!isProxyUrl(url)) {
+      invalid.push({ line: index + 1, raw })
+      continue
+    }
+    const key = proxyUrlKey(url)
+    if (existingKeys.has(key) || seenKeys.has(key)) {
+      duplicateCount += 1
+      continue
+    }
+    if (form.nodes.length - (hasBlankPlaceholder ? 1 : 0) + additions.length >= 256) {
+      invalid.push({ line: index + 1, raw, limit: true })
+      continue
+    }
+    seenKeys.add(key)
+    additions.push({
+      id: '',
+      name: parts.join(' ').trim() || `节点 ${form.nodes.length - (hasBlankPlaceholder ? 1 : 0) + additions.length + 1}`,
+      url,
+      enabled: true,
+      has_credentials: false,
+    })
+  }
+
+  if (additions.length) {
+    if (hasBlankPlaceholder) form.nodes.splice(0, 1)
+    form.nodes.push(...additions)
+  }
+  proxyGroupBatchMessage.value = additions.length || duplicateCount
+    ? `已添加 ${additions.length} 个节点${duplicateCount ? `，跳过 ${duplicateCount} 个重复地址` : ''}。`
+    : ''
+  proxyGroupBatchError.value = invalid.length
+    ? `${invalid.length} 行未添加：${invalid.slice(0, 5).map((item) => `${item.line} 行${item.limit ? '超过 256 个节点上限' : '地址格式无效'}`).join('、')}${invalid.length > 5 ? '等' : ''}。`
+    : ''
+  proxyGroupBatchText.value = invalid.map((item) => item.raw).join('\n')
+  if (!additions.length && !duplicateCount && !invalid.length) {
+    proxyGroupBatchError.value = '没有可添加的代理地址。'
+    return
+  }
+  if (!invalid.length) proxyGroupBatchOpen.value = false
+}
+
+function addProxyGroupNode() {
+  proxyGroupForm.value.nodes.push({
+    id: '',
+    name: `节点 ${proxyGroupForm.value.nodes.length + 1}`,
+    url: '',
+    enabled: true,
+    has_credentials: false,
+  })
+}
+
+function removeProxyGroupNode(index) {
+  if (proxyGroupForm.value.nodes.length <= 1) return
+  proxyGroupForm.value.nodes.splice(index, 1)
+}
+
+async function saveProxyGroup() {
+  const form = proxyGroupForm.value
+  if (!form.name.trim()) {
+    proxyGroupError.value = '请输入代理组名称。'
+    return
+  }
+  if (!form.nodes.length || form.nodes.some((node) => !node.url.trim())) {
+    proxyGroupError.value = '至少保留一个代理节点，并填写节点地址。'
+    return
+  }
+  proxyGroupSaving.value = true
+  proxyGroupError.value = ''
+  try {
+    const path = form.id ? `/admin/proxy-groups/${form.id}` : '/admin/proxy-groups'
+    const result = await adminRequest(path, {
+      method: form.id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: form.name,
+        strategy: form.strategy,
+        rotation_interval_minutes: Number(form.rotation_interval_minutes) || 0,
+        enabled: form.enabled,
+        nodes: form.nodes.map((node) => ({
+          id: node.id || undefined,
+          name: node.name,
+          url: node.url,
+          enabled: node.enabled,
+        })),
+      }),
+    })
+    if (result.group) {
+      const index = proxyGroups.value.findIndex((item) => item.id === result.group.id)
+      if (index >= 0) proxyGroups.value[index] = result.group
+      else proxyGroups.value.push(result.group)
+    }
+    proxyGroupOpen.value = false
+    await loadSettings()
+    pushToast('success', '代理组已保存', '代理组配置已立即生效。')
+  } catch (error) {
+    proxyGroupError.value = error.message
+    pushToast('error', '保存代理组失败', error.message)
+  } finally {
+    proxyGroupSaving.value = false
+  }
+}
+
+function openDeleteProxyGroup(group) {
+  if (group.can_delete === false) {
+    pushToast('warning', '代理组正在使用', '请先在系统设置中取消选择该代理组。')
+    return
+  }
+  proxyGroupDeleteDialog.value = { open: true, id: group.id, name: group.name }
+}
+
+function closeDeleteProxyGroup() {
+  proxyGroupDeleteDialog.value = { open: false, id: '', name: '' }
+}
+
+async function confirmDeleteProxyGroup() {
+  const { id } = proxyGroupDeleteDialog.value
+  closeDeleteProxyGroup()
+  try {
+    await adminRequest(`/admin/proxy-groups/${id}`, { method: 'DELETE' })
+    proxyGroups.value = proxyGroups.value.filter((item) => item.id !== id)
+    await loadSettings()
+    pushToast('success', '代理组已删除', '代理组已从配置中移除。')
+  } catch (error) {
+    pushToast('error', '删除代理组失败', error.message)
+    await loadProxyGroups()
+  }
 }
 
 function normalizedPageSize(value) {
@@ -651,6 +1077,7 @@ async function loadActiveView(view = activeView.value) {
   if (view === 'cdks') return loadCdks()
   if (view === 'redemptions') return loadRedemptions()
   if (view === 'logs') return Promise.all([loadOperationTasks(), loadOperationLogs()])
+  if (view === 'proxies') return Promise.all([loadProxyGroups(), loadProxyHealthSettings(), loadSettings()])
   if (view === 'settings') return loadSettings()
   return null
 }
@@ -923,6 +1350,7 @@ function openCdkForAccount(account) {
 }
 
 watch(activeView, syncOperationViewPolling)
+watch([activeView, adminToken], syncProxyHealthPolling)
 
 function updateSelection(selected, id, checked) {
   if (checked && !selected.value.includes(id)) selected.value = [...selected.value, id]
@@ -1421,10 +1849,15 @@ function goPublic() {
 }
 
 onMounted(async () => {
+  document.addEventListener('visibilitychange', syncProxyHealthPolling)
   if (isAdmin.value && adminToken.value) await loadAdminData()
+  syncProxyHealthPolling()
 })
 
 onUnmounted(() => {
+  document.removeEventListener('visibilitychange', syncProxyHealthPolling)
+  if (proxyHealthPollTimer) window.clearInterval(proxyHealthPollTimer)
+  proxyHealthPollTimer = null
   stopAdminTaskPolling()
   clearAdminTaskMessageTimer()
   clearSettingsMessageTimer()
@@ -1491,7 +1924,7 @@ onUnmounted(() => {
           <h1>{{ activePageMeta.title }}</h1>
           <p class="page-description">{{ activePageMeta.description }}</p>
         </div>
-        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || accountValidationBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton v-if="activeView === 'settings'" type="button" variant="primary" size="sm" :disabled="settingsSaving" @click="saveSettings"><LoaderCircle v-if="settingsSaving" :size="15" class="spin" /><Save v-else :size="15" />保存参数</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
+        <div class="header-actions"><NButton v-if="activeView === 'accounts'" type="button" variant="outline" size="sm" :disabled="accountExportBusy || accountValidationBusy || !selectedAccountIds.length" @click="exportSelectedAccounts"><LoaderCircle v-if="accountExportBusy" :size="15" class="spin" /><Download v-else :size="15" />导出选中</NButton><NButton v-if="activeView === 'accounts'" type="button" variant="primary" size="sm" @click="openAccountImport"><Upload :size="15" />导入账号</NButton><NButton v-if="activeView === 'cdks'" type="button" variant="primary" size="sm" @click="openCdkGenerator"><KeyRound :size="15" />生成 CDK</NButton><NButton v-if="activeView === 'proxies'" type="button" variant="primary" size="sm" @click="resetProxyGroupForm()"><Plus :size="15" />新建代理组</NButton><NButton v-if="activeView === 'settings'" type="button" variant="primary" size="sm" :disabled="settingsSaving" @click="saveSettings"><LoaderCircle v-if="settingsSaving" :size="15" class="spin" /><Save v-else :size="15" />保存参数</NButton><NButton class="refresh-button" icon-only variant="outline" size="sm" type="button" title="刷新数据" @click="loadAdminData"><RefreshCw :size="16" /></NButton></div>
       </header>
 
       <section v-if="activeView === 'overview'" class="overview-view">
@@ -1522,17 +1955,47 @@ onUnmounted(() => {
         </FormSection>
       </section>
 
+      <section v-if="activeView === 'proxies'" class="workspace-section proxy-groups-view">
+        <CalloutBox tone="info" variant="soft" size="sm" class="section-message">代理节点地址会加密保存；自动检测发送不含账号凭据的轻量请求，超阈值或连接失败的节点会暂停分配。</CalloutBox>
+        <FormSection class="proxy-health-settings" title="自动延时检测" description="以响应头耗时测量连接与 TLS 建连延迟；目标站点非 2xx 响应不会单独隔离节点。" variant="outline" size="sm">
+          <div class="proxy-health-controls">
+            <div class="proxy-health-toggle"><NCheckbox v-model="proxyHealthSettings.enabled" :disabled="proxyHealthSaving">启用自动检测与隔离</NCheckbox></div>
+            <FormField label="检测间隔（分钟）"><NInput v-model.number="proxyHealthSettings.interval_minutes" type="number" min="1" max="30" size="sm" block :disabled="proxyHealthSaving" /></FormField>
+            <FormField label="隔离延时阈值（ms）"><NInput v-model.number="proxyHealthSettings.threshold_ms" type="number" min="1" max="60000" size="sm" block :disabled="proxyHealthSaving" /></FormField>
+            <div class="proxy-health-save"><NButton type="button" variant="primary" size="sm" :disabled="proxyHealthSaving || !proxyHealthSettingsDirty" @click="saveProxyHealthSettings"><LoaderCircle v-if="proxyHealthSaving" :size="15" class="spin" /><Save v-else :size="15" />保存检测设置</NButton></div>
+          </div>
+          <small class="setting-description">默认每 5 分钟检测；隔离后约 30 秒复测，连续两次低于阈值的 80% 后恢复。手动测活仅作诊断，不修改自动隔离状态。</small>
+        </FormSection>
+        <FormSection title="代理组" description="为验活出口维护具名代理组和节点。" variant="outline" size="sm">
+          <TableShell class="data-table proxy-groups-table" :show-empty="!proxyGroups.length" :empty-colspan="5" empty-title="暂无代理组" empty-description="新建代理组后可在系统参数中选择。" variant="soft" size="sm">
+            <template #head><tr><th>代理组</th><th>策略</th><th>状态</th><th>节点</th><th class="action-cell">操作</th></tr></template>
+            <tr v-for="group in proxyGroups" :key="group.id">
+              <td><b>{{ group.name }}</b><small>{{ group.id }}</small></td>
+              <td>{{ group.strategy === 'round_robin' ? '轮询' : group.strategy === 'time_window' ? `定时轮换 · ${group.rotation_interval_minutes} 分钟` : '请求随机' }}</td>
+              <td><StatusPill :label="group.enabled ? '启用' : '停用'" :tone="group.enabled ? 'success' : 'neutral'" size="xs" radius="rounded" /></td>
+              <td><div class="proxy-node-summary"><div v-for="node in group.nodes" :key="node.id" :class="['proxy-health-node-line', { disabled: !node.enabled }]">
+                <div class="proxy-health-node-copy"><span class="proxy-node-chip" :title="node.url">{{ node.name || '未命名节点' }} · {{ node.url }}</span><div class="proxy-health-node-status"><StatusPill :label="proxyNodeHealthLabel(node)" :tone="proxyNodeHealthTone(node)" size="xs" radius="rounded" /><small>{{ proxyNodeHealthSummary(node, group.id) }}</small></div></div>
+                <NButton type="button" variant="outline" size="xs" icon-only title="手动测活" :disabled="Boolean(proxyHealthTestingKey)" @click="testProxyNode(group, node)"><LoaderCircle v-if="proxyHealthTestingKey === proxyHealthTestKey(group.id, node.id)" :size="14" class="spin" /><Activity v-else :size="14" /></NButton>
+              </div></div></td>
+              <td class="action-cell"><div class="proxy-group-action-buttons"><NButton type="button" variant="outline" size="xs" @click="resetProxyGroupForm(group)"><Save :size="14" />编辑</NButton><NButton type="button" variant="danger" size="xs" icon-only title="删除代理组" :disabled="group.can_delete === false" @click="openDeleteProxyGroup(group)"><Trash2 :size="14" /></NButton></div></td>
+            </tr>
+          </TableShell>
+        </FormSection>
+      </section>
+
       <section v-if="activeView === 'settings'" class="workspace-section settings-view">
         <CalloutBox v-if="settingsMessage" tone="success" variant="soft" size="sm" class="section-message">{{ settingsMessage }}</CalloutBox>
         <CalloutBox v-if="settingsError" tone="error" variant="soft" size="sm" class="section-message">{{ settingsError }}</CalloutBox>
         <div v-if="systemSettings.length" class="settings-sections">
           <FormSection v-for="group in systemSettings" :key="group.key" :title="group.label" variant="outline" size="sm">
             <div class="settings-grid">
-              <FormField v-for="item in group.items" :key="item.key" :label="item.label">
-                <SelectMenu v-if="item.type === 'select'" v-model="item.value" :options="item.options" width="full" placement="auto" :aria-label="item.label" />
-                <NInput v-else v-model="item.value" :type="item.type === 'integer' || item.type === 'number' ? 'number' : 'text'" :min="item.min ?? undefined" :max="item.max ?? undefined" :step="item.type === 'number' ? 'any' : '1'" size="sm" block :aria-label="item.label" />
-                <small class="setting-description">{{ item.description }}<span v-if="item.unit"> · {{ item.unit }}</span></small>
-              </FormField>
+              <template v-for="item in group.items" :key="item.key">
+                <FormField v-if="isSystemSettingVisible(item)" :label="item.label">
+                  <SelectMenu v-if="item.type === 'select' || item.type === 'proxy_group'" :model-value="item.value" :options="item.options" width="full" placement="auto" :aria-label="item.label" @update:model-value="updateSystemSettingValue(item, $event)" />
+                  <NInput v-else v-model="item.value" :type="item.type === 'integer' || item.type === 'number' ? 'number' : 'text'" :min="item.min ?? undefined" :max="item.max ?? undefined" :step="item.type === 'number' ? 'any' : '1'" size="sm" block :aria-label="item.label" />
+                  <small class="setting-description">{{ item.description }}<span v-if="item.unit"> · {{ item.unit }}</span></small>
+                </FormField>
+              </template>
             </div>
           </FormSection>
         </div>
@@ -1599,6 +2062,35 @@ onUnmounted(() => {
       </section>
     </main>
   </div>
+
+  <ModalShell :open="proxyGroupOpen" :title="proxyGroupForm.id ? '编辑代理组' : '新建代理组'" description="配置节点地址、启用状态和节点选择策略。" max-width="820px" @close="proxyGroupOpen = false">
+    <div class="proxy-group-dialog-body">
+      <div class="proxy-group-form-grid">
+        <FormField label="代理组名称"><NInput v-model="proxyGroupForm.name" size="sm" block placeholder="例如：海外验活出口" /></FormField>
+        <FormField label="节点策略"><SelectMenu v-model="proxyGroupForm.strategy" :options="[{ label: '请求随机', value: 'request_random' }, { label: '轮询', value: 'round_robin' }, { label: '定时轮换', value: 'time_window' }]" width="full" placement="auto" aria-label="节点策略" /></FormField>
+        <FormField v-if="proxyGroupForm.strategy === 'time_window'" label="轮换间隔"><NInput v-model.number="proxyGroupForm.rotation_interval_minutes" type="number" min="1" max="1440" size="sm" block /><small class="setting-description">单位：分钟</small></FormField>
+        <div class="proxy-group-enabled"><NCheckbox v-model="proxyGroupForm.enabled">启用代理组</NCheckbox></div>
+      </div>
+      <div class="proxy-node-editor">
+        <div class="proxy-node-editor-heading"><div><strong>代理节点</strong><small>认证信息不会在列表中回显；编辑时保留未修改的脱敏地址即可。</small></div><div class="proxy-node-editor-actions"><NButton type="button" variant="outline" size="xs" @click="openProxyGroupBatch"><Upload :size="14" />批量添加</NButton><NButton type="button" variant="outline" size="xs" @click="addProxyGroupNode"><Plus :size="14" />添加节点</NButton></div></div>
+        <div v-if="proxyGroupBatchOpen" class="proxy-batch-editor">
+          <div class="proxy-batch-heading"><strong>批量添加代理节点</strong><small>每行一个代理地址；地址后的文字会作为节点名称。空行和以 # 开头的行会跳过。</small></div>
+          <textarea v-model="proxyGroupBatchText" class="proxy-batch-textarea" rows="7" placeholder="http://127.0.0.1:7890&#10;http://user:password@host:7890 海外节点&#10;socks5://127.0.0.1:1080" aria-label="批量代理地址" spellcheck="false" autocomplete="off" />
+          <CalloutBox v-if="proxyGroupBatchMessage" tone="success" variant="soft" size="sm">{{ proxyGroupBatchMessage }}</CalloutBox>
+          <CalloutBox v-if="proxyGroupBatchError" tone="error" variant="soft" size="sm">{{ proxyGroupBatchError }}</CalloutBox>
+          <div class="proxy-batch-actions"><NButton type="button" variant="outline" size="xs" @click="closeProxyGroupBatch">取消</NButton><NButton type="button" variant="primary" size="xs" @click="appendProxyGroupBatch"><Plus :size="14" />添加到节点列表</NButton></div>
+        </div>
+        <div v-for="(node, index) in proxyGroupForm.nodes" :key="node.id || `new-${index}`" class="proxy-node-form-row">
+          <NInput v-model="node.name" size="sm" placeholder="节点名称" aria-label="节点名称" />
+          <NInput v-model="node.url" size="sm" block placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" aria-label="代理地址" />
+          <NCheckbox v-model="node.enabled" aria-label="启用节点">启用</NCheckbox>
+          <NButton type="button" variant="danger" size="xs" icon-only title="移除节点" :disabled="proxyGroupForm.nodes.length <= 1" @click="removeProxyGroupNode(index)"><Trash2 :size="14" /></NButton>
+        </div>
+      </div>
+      <CalloutBox v-if="proxyGroupError" tone="error" variant="soft" size="sm">{{ proxyGroupError }}</CalloutBox>
+    </div>
+    <template #footer><NButton type="button" variant="outline" size="sm" @click="proxyGroupOpen = false">取消</NButton><NButton type="button" variant="primary" size="sm" :disabled="proxyGroupSaving" @click="saveProxyGroup"><LoaderCircle v-if="proxyGroupSaving" :size="15" class="spin" /><Save v-else :size="15" />保存代理组</NButton></template>
+  </ModalShell>
 
   <ModalShell :open="operationTaskDetailOpen" title="任务详情" :description="operationTaskDetail ? `${taskTypeLabel(operationTaskDetail.task_type)} · 任务 ${operationTaskDetail.id.slice(0, 8)}` : '读取任务详情'" max-width="980px" @close="closeOperationTaskDetail">
     <div v-if="operationTaskDetail" class="operation-task-detail">
@@ -1669,6 +2161,7 @@ onUnmounted(() => {
   </ModalShell>
 
   <ConfirmDialog :open="deleteDialog.open" :title="`删除${deleteDialog.label}`" :message="`确认删除选中的 ${deleteDialog.count} 个${deleteDialog.label}吗？已关联或正在执行的数据仍会由系统保留。`" confirm-text="确认删除" cancel-text="取消" @confirm="confirmDelete" @cancel="closeDeleteDialog" />
+  <ConfirmDialog :open="proxyGroupDeleteDialog.open" title="删除代理组" :message="`确认删除代理组“${proxyGroupDeleteDialog.name}”吗？组内节点配置也会一并移除。`" confirm-text="确认删除" cancel-text="取消" @confirm="confirmDeleteProxyGroup" @cancel="closeDeleteProxyGroup" />
   <ConfirmDialog :open="reissueDialog.open" title="重新签发 CDK" :message="`确认重新签发 ${reissueDialog.prefix}-**** 吗？原 CDK 将立即失效，新 CDK 会保存加密副本并复制到剪贴板。`" confirm-text="重新签发" cancel-text="取消" @confirm="confirmReissue" @cancel="closeReissueDialog" />
   <Toast :toasts="toasts" @remove="removeToast" />
 </template>

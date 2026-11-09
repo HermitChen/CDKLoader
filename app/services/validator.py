@@ -24,6 +24,7 @@ from .openai_validation import (
     is_inconclusive_error,
     redact_credentials,
 )
+from .proxy_health import ProxyHealthMonitor
 from .token_artifacts import normalize_token_artifacts
 
 
@@ -91,14 +92,22 @@ class TokenValidator:
     chatgpt_validation_user_agent = CHATGPT_VALIDATION_USER_AGENT
     chatgpt_validation_client_version = CHATGPT_CLIENT_VERSION
 
-    def __init__(self, settings: Settings, security: SecurityManager):
+    def __init__(
+        self,
+        settings: Settings,
+        security: SecurityManager,
+        proxy_health: ProxyHealthMonitor | None = None,
+    ):
         self.settings = settings
         self.security = security
+        self.proxy_health = proxy_health
         self._account_lock_guard = threading.Lock()
         self._account_locks: dict[str, threading.Lock] = {}
+        self._proxy_group_cursor_guard = threading.Lock()
+        self._proxy_group_cursors: dict[str, int] = {}
 
     def _session(self):
-        return cffi_requests.Session(impersonate=CHATGPT_VALIDATION_IMPERSONATE)
+        return cffi_requests.Session(impersonate=CHATGPT_VALIDATION_IMPERSONATE, trust_env=False)
 
     def _account_lock(self, account: Account) -> threading.Lock:
         key = str(account.id or account.account_id or account.access_token_encrypted or account.email)
@@ -140,21 +149,35 @@ class TokenValidator:
         explicit = self._proxy_value(explicit_proxy)
         if explicit:
             return explicit
-        raw_pool = self.settings.validation_proxy_pool
-        if isinstance(raw_pool, str):
-            candidates = raw_pool.replace(";", "\n").replace(",", "\n").splitlines()
-        elif isinstance(raw_pool, (list, tuple, set)):
-            candidates = list(raw_pool)
-        else:
-            candidates = []
-        candidates = [self._proxy_value(candidate) for candidate in candidates]
-        candidates = [candidate for candidate in candidates if candidate]
         configured = self._proxy_value(self.settings.validation_proxy)
         mode = str(self.settings.validation_egress_mode or "direct").strip().lower()
-        if mode == "pool":
-            return random.choice(candidates) if candidates else configured or None
+        if mode == "group":
+            group_id = self._proxy_value(self.settings.validation_proxy_group_id)
+            group = next(
+                (item for item in self.settings.validation_proxy_groups if item.id == group_id and item.enabled),
+                None,
+            )
+            if group is None:
+                return None
+            nodes = [
+                node for node in group.nodes
+                if node.enabled and self._proxy_value(node.url)
+                and (self.proxy_health is None or self.proxy_health.is_eligible(node.id, node.url))
+            ]
+            if not nodes:
+                return None
+            strategy = str(group.strategy or "request_random").strip().lower()
+            if strategy == "time_window" and group.rotation_interval_minutes > 0:
+                index = int(time.time() // (group.rotation_interval_minutes * 60)) % len(nodes)
+            elif strategy == "round_robin":
+                with self._proxy_group_cursor_guard:
+                    index = self._proxy_group_cursors.get(group.id, 0) % len(nodes)
+                    self._proxy_group_cursors[group.id] = index + 1
+            else:
+                index = random.randrange(len(nodes))
+            return self._proxy_value(nodes[index].url)
         if mode == "account":
-            return self._account_validation_proxy(account) or configured or (random.choice(candidates) if candidates else None)
+            return self._account_validation_proxy(account) or configured or None
         return None
 
     @staticmethod
@@ -180,9 +203,16 @@ class TokenValidator:
                 return ValidationResult("valid", message="结构校验通过", validated_via="structural")
             return ValidationResult("invalid", "credentials", "缺少可验证凭据", "structural")
 
+        selected_proxy = self._validation_proxy_url(account, validation_proxy)
+        if (
+            str(self.settings.validation_egress_mode or "direct").strip().lower() == "group"
+            and not selected_proxy
+        ):
+            return ValidationResult("inconclusive", "proxy", "所选代理组没有健康可用节点")
+
         # One exit is selected for AT checks, RT refresh and the new AT checks.
         manager = TokenRefreshManager(
-            proxy_url=self._validation_proxy_url(account, validation_proxy),
+            proxy_url=selected_proxy,
             client_id=self.settings.oauth_client_id,
             redirect_uri=self.settings.oauth_redirect_uri,
         )
