@@ -204,13 +204,8 @@ class TokenValidator:
             return ValidationResult("invalid", "credentials", "缺少可验证凭据", "structural")
 
         selected_proxy = self._validation_proxy_url(account, validation_proxy)
-        if (
-            str(self.settings.validation_egress_mode or "direct").strip().lower() == "group"
-            and not selected_proxy
-        ):
-            return ValidationResult("inconclusive", "proxy", "所选代理组没有健康可用节点")
-
-        # One exit is selected for AT checks, RT refresh and the new AT checks.
+        # An unavailable group falls back to direct. The manager shares this
+        # exit, including any later direct fallback, across AT checks and RT refresh.
         manager = TokenRefreshManager(
             proxy_url=selected_proxy,
             client_id=self.settings.oauth_client_id,

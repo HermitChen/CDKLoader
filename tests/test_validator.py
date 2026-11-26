@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from curl_cffi.requests.exceptions import ProxyError, Timeout as CurlTimeout
 
+from app.config import ProxyGroupSetting, ProxyNodeSetting
 from app.models import Account, ValidationAttempt, utcnow
 from app.security import SecurityManager
 from app.services.openai_validation import (
@@ -118,16 +119,82 @@ def _success():
     return [("GET", USERINFO, FakeResponse()), ("POST", INIT, FakeResponse()), ("GET", CHECK, FakeResponse())]
 
 
+def _group_settings(settings, proxy="http://validation-proxy.example:8080"):
+    group = ProxyGroupSetting(
+        id="validation-group", name="验活组", strategy="round_robin",
+        rotation_interval_minutes=0, enabled=True,
+        nodes=(ProxyNodeSetting(id="validation-node", name="验活节点", url=proxy),),
+    )
+    return replace(
+        settings, validation_egress_mode="group", validation_proxy_group_id=group.id,
+        validation_proxy_groups=(group,),
+    )
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "disabled", "empty", "disabled-nodes", "isolated"])
+@pytest.mark.parametrize("refresh", [False, True], ids=["current-token", "refresh-token"])
+def test_unavailable_proxy_group_uses_direct_for_entire_chain(settings, security, unavailable, refresh):
+    configured = _group_settings(settings)
+    group = configured.validation_proxy_groups[0]
+    if unavailable == "missing":
+        groups = ()
+    elif unavailable == "disabled":
+        groups = (replace(group, enabled=False),)
+    elif unavailable == "empty":
+        groups = (replace(group, nodes=()),)
+    elif unavailable == "disabled-nodes":
+        groups = (replace(group, nodes=(replace(group.nodes[0], enabled=False),)),)
+    else:
+        groups = (group,)
+    configured = replace(
+        configured, validation_proxy_groups=groups, validation_proxy="http://global-proxy.example:8080",
+    )
+    steps = [("GET", USERINFO, FakeResponse(401)), _refresh_success(), *_success()] if refresh else _success()
+    validator, sessions = _remote_validator(configured, security, steps)
+
+    class IsolatedNodes:
+        def is_eligible(self, _node_id, _proxy_url):
+            return False
+
+    if unavailable == "isolated":
+        validator.proxy_health = IsolatedNodes()
+
+    result = validator.validate(_account(security, proxy_used="http://account-proxy.example:8080"))
+
+    assert result.outcome == "valid"
+    assert result.refreshed is refresh
+    assert all("proxies" not in call for call in sessions.calls)
+    sessions.assert_complete()
+
+
+def test_unavailable_proxy_group_direct_failure_preserves_account_without_refresh(settings, security):
+    configured = replace(_group_settings(settings), validation_proxy_groups=())
+    validator, sessions = _remote_validator(configured, security, [
+        ("GET", USERINFO, CurlTimeout("direct read timed out")) for _ in range(3)
+    ])
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "inconclusive"
+    assert result.status == "available"
+    assert result.refreshed is False
+    assert len(sessions.calls) == 3
+    assert all("proxies" not in call for call in sessions.calls)
+    sessions.assert_complete()
+
+
+@pytest.mark.parametrize("mode", ["account", "group"])
 @pytest.mark.parametrize("failure", [
     pytest.param(CurlTimeout("proxy connection timed out"), id="curl-timeout"),
     pytest.param(ProxyError("proxy connection failed"), id="proxy-error"),
     pytest.param(FakeResponse(504), id="gateway-timeout"),
 ])
-def test_proxy_timeout_retries_validation_direct_and_keeps_direct_for_chain(settings, security, failure):
+def test_proxy_timeout_retries_validation_direct_and_keeps_direct_for_chain(settings, security, failure, mode):
     proxy = "http://validation-proxy.example:8080"
-    validator, sessions = _remote_validator(replace(
+    configured = _group_settings(settings, proxy) if mode == "group" else replace(
         settings, validation_egress_mode="account", validation_proxy=proxy,
-    ), security, [("GET", USERINFO, failure), *_success()])
+    )
+    validator, sessions = _remote_validator(configured, security, [("GET", USERINFO, failure), *_success()])
 
     result = validator.validate(_account(security))
 
@@ -159,6 +226,24 @@ def _refresh_success():
         "access_token": "new-access-token", "refresh_token": "new-refresh-token",
         "id_token": "new-id-token", "expires_in": 3600,
     }))
+
+
+def test_group_proxy_failure_keeps_direct_for_refresh_and_new_token_check(settings, security):
+    validator, sessions = _remote_validator(_group_settings(settings), security, [
+        ("GET", USERINFO, ProxyError("proxy connection failed")),
+        ("GET", USERINFO, FakeResponse(401)), _refresh_success(), *_success(),
+    ])
+
+    result = validator.validate(_account(security))
+
+    assert result.outcome == "valid"
+    assert result.refreshed is True
+    assert result.recoverable is True
+    assert sessions.calls[0]["proxies"] == {
+        "http": "http://validation-proxy.example:8080", "https": "http://validation-proxy.example:8080",
+    }
+    assert all("proxies" not in call for call in sessions.calls[1:])
+    sessions.assert_complete()
 
 
 def test_full_manager_request_chain_headers_payload_and_device_cookies(settings, security):

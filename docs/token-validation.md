@@ -50,7 +50,7 @@ codex-manager 的 Token 验证没有这套全局冷却。迁移后已删除共�
 | 账号检查 | 固定携带 `timezone_offset_min=-480` |
 | 超时 | 每次请求 30 秒 |
 | 临时失败 | 最多三次，间隔 0.25、0.75 秒；每次新建会话，从 userinfo 重跑完整链路 |
-| 出口 | 当前 AT、RT 刷新、新 AT 复检共用本轮选定的出口 |
+| 出口 | 当前 AT、RT 刷新、新 AT 复检共用本轮出口；代理组无可用节点时直连，请求触发直连回退后后续阶段继续直连 |
 
 userinfo 只携带 manager 的身份验证头；两个 ChatGPT 接口使用同一套 origin、referer、语言、设备、会话、版本、目标路由和 fetch-metadata 头。请求流程不增加 Sentinel 预检、浏览器预热或自定义挑战解算。
 

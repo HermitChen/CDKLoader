@@ -197,7 +197,7 @@ RUNTIME_SETTING_SPECS: tuple[RuntimeSettingSpec, ...] = (
         "validation",
         "验活",
         "验活代理组",
-        "代理组模式下，远端验活从所选组中选择节点",
+        "优先使用所选代理组，无可用节点时自动直连",
         "proxy_group",
         "",
     ),
